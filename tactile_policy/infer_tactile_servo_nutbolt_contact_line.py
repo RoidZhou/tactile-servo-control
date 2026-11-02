@@ -124,6 +124,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--left-tactile-port", type=int, default=5100)
     parser.add_argument("--right-tactile-port", type=int, default=5101)
     parser.add_argument("--tactile-timeout-ms", type=int, default=15000)
+    parser.add_argument(
+        "--tactile-sync-max-skew-ms", type=float, default=100.0,
+        help="Maximum left/right capture-time difference for contact-line inference (ms).",
+    )
     parser.add_argument("--xense-force-height", type=int, default=XENSE_FORCE_HEIGHT)
     parser.add_argument("--xense-force-width", type=int, default=XENSE_FORCE_WIDTH)
     parser.add_argument("--xense-left-serial", default=XENSE_LEFT_SERIAL)
@@ -399,6 +403,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--yes", action="store_true", help="Skip the final RUN prompt.")
     args = parser.parse_args()
+    if not np.isfinite(args.tactile_sync_max_skew_ms) or not 0 < args.tactile_sync_max_skew_ms <= 150:
+        parser.error("--tactile-sync-max-skew-ms must be in (0, 150].")
     for name in ("balance_kp_mm_per_n_s", "balance_max_speed_mm_s", "balance_max_travel_mm",
                  "balance_min_contact_n", "balance_recovery_timeout_s"):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
@@ -1231,8 +1237,13 @@ class ContactLineWindow:
 
 
 def _fresh_tactile_timestamp(left: dict, right: dict) -> tuple[float, float]:
-    stamps = tuple(float(frame.get("capture_timestamp") or frame.get("timestamp") or 0)
-                   for frame in (left, right))
+    # Match the collector: both captures must use the SDK capture clock.
+    # Publication timestamps are not interchangeable with capture timestamps.
+    try:
+        stamps = tuple(float(frame.get("capture_timestamp") or 0)
+                       for frame in (left, right))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SafetyStop("contact-line probing requires valid Xense capture timestamps") from exc
     if not all(np.isfinite(value) and value > 0 for value in stamps):
         raise SafetyStop("contact-line probing requires valid Xense capture timestamps")
     return stamps
@@ -1384,7 +1395,7 @@ def run_contact_line_probe(args, robot, tactile, force_reader, model, norm, devi
     output = args.contact_line_output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
-        "time_s", "left_stamp", "right_stamp",
+        "time_s", "left_stamp", "right_stamp", "left_right_delta_ms",
         "probe_cycle", "probe_waypoint", "probe_stage", "probe_progress",
         "probe_local_roll", "probe_local_pitch", "probe_local_yaw",
         "tcp_x", "tcp_y", "tcp_z", "tcp_rx", "tcp_ry", "tcp_rz",
@@ -1404,14 +1415,17 @@ def run_contact_line_probe(args, robot, tactile, force_reader, model, norm, devi
     ]
     started = time.monotonic()
     last_stamps = None
+    last_sync_print = float("-inf")
     reference_force = None
     period = 1.0 / args.control_hz
+    print(f"[contact-line] left/right capture skew limit: {args.tactile_sync_max_skew_ms:g} ms; "
+          "unsynchronized pairs are skipped", flush=True)
 
     def observe(
         writer, target: np.ndarray, cycle: int, waypoint: int,
         stage: str, progress: float, local_rpy: np.ndarray,
     ) -> dict | None:
-        nonlocal last_stamps, reference_force
+        nonlocal last_stamps, reference_force, last_sync_print
         left, right = tactile.read()
         check_safety(args, force_reader, left, right)
         if min(tactile_peaks(left, right)) < args.min_tactile_peak:
@@ -1419,6 +1433,15 @@ def run_contact_line_probe(args, robot, tactile, force_reader, model, norm, devi
         stamps = _fresh_tactile_timestamp(left, right)
         if last_stamps is not None and not all(
                 current > previous for current, previous in zip(stamps, last_stamps)):
+            return None
+        delta_ms = abs(stamps[0] - stamps[1]) * 1000
+        if delta_ms > args.tactile_sync_max_skew_ms:
+            now = time.monotonic()
+            if now - last_sync_print >= 1.0:
+                print(f"[contact-line] Skipping unsynchronized tactile pair: "
+                      f"left/right delta={delta_ms:.3f} ms > "
+                      f"{args.tactile_sync_max_skew_ms:g} ms", flush=True)
+                last_sync_print = now
             return None
         last_stamps = stamps
         actual = np.asarray(robot.get_tcp_pose(), dtype=np.float64)
@@ -1451,6 +1474,7 @@ def run_contact_line_probe(args, robot, tactile, force_reader, model, norm, devi
         row = {
             "time_s": time.monotonic() - started,
             "left_stamp": stamps[0], "right_stamp": stamps[1],
+            "left_right_delta_ms": delta_ms,
             "probe_cycle": int(cycle), "probe_waypoint": int(waypoint),
             "probe_stage": stage, "probe_progress": float(progress),
             "probe_local_roll": local_rpy[0],
