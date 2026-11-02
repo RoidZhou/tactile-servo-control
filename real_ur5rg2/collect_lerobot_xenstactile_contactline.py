@@ -354,8 +354,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-serial-register-address", type=int, default=180)
     parser.add_argument("--force-serial-function-code", type=int, default=3)
     parser.add_argument("--force-serial-baudrate", type=int, default=19200)
-    parser.add_argument("--force-serial-timeout-s", type=float, default=0.02)
-    parser.add_argument("--force-serial-retries", type=int, default=3)
+    parser.add_argument(
+        "--force-serial-timeout-s", type=float, default=0.2,
+        help="Modbus RTU response timeout. 0.2 s avoids truncating delayed USB/RS485 CRC bytes.",
+    )
+    parser.add_argument("--force-serial-retries", type=int, default=5)
     parser.add_argument(
         "--force-serial-wakeup",
         action=argparse.BooleanOptionalAction,
@@ -555,7 +558,7 @@ def parse_args() -> argparse.Namespace:
         help="Fingertip-local translation/rotvec component limits in m,m,m,rad,rad,rad; default angles 1,1,1.2 deg.",
     )
     parser.add_argument(
-        "--ou-moving-average", type=int, default=100,
+        "--ou-moving-average", type=int, default=20,
         help="Moving-average length used to smooth the OU trajectory, as in the reference project.",
     )
     parser.add_argument("--move-step", type=float, default=0.001)
@@ -1141,13 +1144,32 @@ class ForceReader:
 def calibrate_force_bias(force_reader: ForceReader, fps: int) -> np.ndarray:
     num_samples = max(10, int(FORCE_TARE_SECONDS * fps))
     samples = []
+    failures = 0
+    max_attempts = num_samples * 5
     print(
         "Calibrating FTS-300-S force bias. Keep the end effector still and "
         "unloaded..."
     )
-    for _ in range(num_samples):
-        samples.append(force_reader.read())
+    for _ in range(max_attempts):
+        try:
+            samples.append(force_reader.read())
+        except RuntimeError as exc:
+            failures += 1
+            if failures <= 3 or failures % 10 == 0:
+                print(
+                    f"FTS calibration skipped transient Modbus frame "
+                    f"({failures}/{max_attempts - num_samples} allowed): {exc}"
+                )
+        if len(samples) >= num_samples:
+            break
         time.sleep(1.0 / max(1, fps))
+
+    if len(samples) < num_samples:
+        raise RuntimeError(
+            f"FTS calibration obtained only {len(samples)}/{num_samples} valid "
+            f"frames after {max_attempts} attempts. Check exclusive serial-port "
+            "ownership, baud rate, wiring and sensor power."
+        )
 
     bias = np.mean(np.stack(samples, axis=0), axis=0).astype(np.float32)
     values = [float(v) for v in bias]

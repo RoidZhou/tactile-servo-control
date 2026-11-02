@@ -49,10 +49,7 @@ training on these trajectories.
 Train the paired model:
 
 ```bash
-python tactile_policy/train_relative_se3.py \
-  --dataset-root real_ur5rg2/data/nut_relative_ou \
-  --output-dir tactile_policy/outputs/nut_relative_se3 \
-  --pairs-per-episode 10
+python tactile_policy/train_relative_se3.py --dataset-root /media/zhou/Elements SE/YBZHOU/nut_relative_ou_no_fts --output-dir tactile_policy/outputs/nut_relative_se3 --pairs-per-episode 10
 ```
 
 Training and validation are split by complete episodes. For every selected
@@ -66,3 +63,8 @@ label = [local_x, local_y, local_z, local_rotation_vector]
 The network input order is `[left_1, left_2, right_1, right_2]`, using one
 shared tactile encoder, as in the reference fixed-base FC method. The native
 XENSE `35x20` force grid is not resized.
+
+python real_ur5rg2/merge_lerobot_datasets.py \
+  --source "/media/zhou/Elements SE/YBZHOU/nut_relative_ou" \
+  --source "/media/zhou/Elements SE/YBZHOU/nut_relative_ou_no_fts_test2" \
+  --output "/media/zhou/Elements SE/YBZHOU/nut_relative_ou_217"

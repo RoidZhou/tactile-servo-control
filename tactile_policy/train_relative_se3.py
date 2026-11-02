@@ -23,21 +23,21 @@ except ImportError:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset-root", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("tactile_policy/outputs/relative_se3"))
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--dataset-root", type=Path, default=Path("/media/zhou/Elements SE/YBZHOU/nut_relative_ou_217"))
+    parser.add_argument("--output-dir", type=Path, default=Path("tactile_policy/outputs/relative_se3_200_217"))
+    parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--pairs-per-episode", type=int, default=10)
+    parser.add_argument("--pairs-per-episode", type=int, default=200)
     parser.add_argument("--val-ratio", type=float, default=0.2)
-    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--patience", type=int, default=300)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--target-limit",
-        default="0.00025,0.0005,0.0005,0.003490659,0.010471976,0.020943951",
+        default="0.0035,0.003,0.0015,0.030,0.035,0.040",
         help="Normalization limits dx,dy,dz(m), drx,dry,drz(rad), matching OU limits.",
     )
     args = parser.parse_args()
@@ -97,7 +97,11 @@ def main() -> None:
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=10,
+        min_lr=1e-6,
     )
     limit = torch.as_tensor(normalization.target_limit, device=device)
     args.output_dir.mkdir(parents=True, exist_ok=True)
