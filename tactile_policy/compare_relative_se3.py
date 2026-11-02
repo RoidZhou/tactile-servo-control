@@ -20,6 +20,48 @@ except ImportError:
     from model import PAIRWISE_MODEL_TYPES, load_pairwise_model
 
 SCALE = np.array([1000.] * 3 + [180 / np.pi] * 3)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_dataset_root(requested, checkpoints):
+    """Use the saved training source when the caller omits --dataset-root."""
+    if requested is not None:
+        return Path(requested).expanduser().resolve()
+    roots = [cp.get('args', {}).get('dataset_root') for cp in checkpoints]
+    if not all(roots) or len(set(map(str, roots))) != 1:
+        raise ValueError(
+            'Checkpoints have different or missing training dataset paths. '
+            'Pass --dataset-root explicitly with the dataset to compare.'
+        )
+    return Path(roots[0]).expanduser().resolve()
+
+
+def common_validation_episodes(unique, checkpoints, checkpoint_paths, root):
+    """Use persisted validation IDs, or reconstruct a legacy split on its source."""
+    eligible = set(map(int, unique))
+    for cp, path in zip(checkpoints, checkpoint_paths):
+        info, config = cp['dataset_info'], cp['args']
+        saved_ids = info.get('val_episode_ids')
+        if saved_ids is not None:
+            eligible &= set(map(int, saved_ids))
+            continue
+        if info['episodes'] != len(unique):
+            raise ValueError(
+                f'Dataset episode count differs from training for checkpoint {path}: '
+                f'current dataset {root} has {len(unique)} episodes; '
+                f'checkpoint expects {info["episodes"]}. '
+                f'Training dataset: {config.get("dataset_root", "unknown")}. '
+                'This legacy checkpoint has no saved validation episode IDs. '
+                'Use its original training dataset and select the intended weights '
+                'with --dataset-root and --checkpoint. Do not reconstruct its '
+                'validation split from an expanded or different dataset.'
+            )
+        shuffled = np.random.default_rng(int(config['seed'])).permutation(unique)
+        n = min(len(unique)-1, max(1, round(len(unique)*float(config['val_ratio']))))
+        eligible &= set(map(int, shuffled[:n]))
+    if not eligible:
+        raise ValueError('Checkpoints have no common held-out episodes in this dataset')
+    return eligible
 
 
 def metrics(prediction, target):
@@ -41,10 +83,11 @@ def metrics(prediction, target):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--dataset-root', type=Path, default=Path("/media/zhou/Elements SE/YBZHOU/nut_relative_ou_no_fts"))
+    parser.add_argument('--dataset-root', type=Path,
+                        help='Defaults to the training dataset path stored in all selected checkpoints.')
     parser.add_argument('--checkpoint', type=Path, nargs='+', default=[
-        Path('/home/zhou/vla/ur5-tactile-servo-control/tactile_policy/outputs/relative_se3_100/best_model.pt'),
-        Path('/home/zhou/vla/ur5-tactile-servo-control/tactile_policy/outputs/relative_se3_200/best_model.pt'),
+        PROJECT_ROOT / 'tactile_policy/outputs/relative_se3_200_217/best_model.pt',
+        PROJECT_ROOT / 'tactile_policy/outputs/relative_se3_200_217_resnet/best_model.pt',
     ])
     parser.add_argument('--names', nargs='+', help='Unique labels, e.g. old new')
     parser.add_argument('--output-dir', type=Path, default=Path("tactile_policy/outputs/compare_relative_se3"))
@@ -59,6 +102,12 @@ def main():
     names = args.names or [f'model_{i}' for i in range(len(args.checkpoint))]
     if len(names) != len(args.checkpoint) or len(set(names)) != len(names):
         parser.error('--names must contain one unique name per checkpoint')
+    for path in args.checkpoint:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f'Checkpoint not found: {path}. Pass --checkpoint followed by the '
+                'actual best_model.pt paths for the models you trained.'
+            )
     checkpoints = [torch.load(p, map_location='cpu', weights_only=False) for p in args.checkpoint]
     for cp in checkpoints:
         if cp.get('model_type') not in PAIRWISE_MODEL_TYPES:
@@ -66,7 +115,7 @@ def main():
         if cp.get('transform_convention') != 'inv(T_world_tcp_1) @ T_world_tcp_2; local xyz + rotvec':
             raise ValueError('Unsupported or missing checkpoint transform convention')
 
-    root = args.dataset_root.expanduser().resolve()
+    root = resolve_dataset_root(args.dataset_root, checkpoints)
     files = sorted((root / 'data').rglob('*.parquet'))
     if not files:
         raise ValueError('No parquet data found')
@@ -85,22 +134,20 @@ def main():
     digest.update(poses[order].astype('<f8').tobytes())
     fingerprint = digest.hexdigest()
     unique = np.unique(eps)
-    eligible = set(unique.tolist())
-    for cp in checkpoints:
-        info, config = cp['dataset_info'], cp['args']
-        if info['episodes'] != len(unique):
-            raise ValueError('Dataset episode count differs from training; cannot safely reconstruct held-out split')
-        shuffled = np.random.default_rng(int(config['seed'])).permutation(unique)
-        n = min(len(unique)-1, max(1, round(len(unique)*float(config['val_ratio']))))
-        eligible &= set(shuffled[:n].tolist())
-    if not eligible:
-        raise ValueError('Checkpoints have no common held-out episodes')
+    print(f'Dataset: {root} ({len(unique)} episodes)', flush=True)
+    for name, path, cp in zip(names, args.checkpoint, checkpoints):
+        print(f'{name}: {path} (trained with {cp["dataset_info"]["episodes"]} episodes)', flush=True)
+    eligible = common_validation_episodes(unique, checkpoints, args.checkpoint, root)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     path = args.manifest or args.output_dir / 'validation_pairs.json'
     if path.exists():
         manifest = json.loads(path.read_text())
         if manifest['pose_index_sha256'] != fingerprint:
-            raise ValueError('Manifest dataset pose/index fingerprint mismatch')
+            raise ValueError(
+                f'Manifest {path} belongs to a different dataset. '
+                'Choose a new --output-dir for this comparison, or pass an existing '
+                '--manifest created on the same dataset.'
+            )
     else:
         if args.manifest:
             raise FileNotFoundError(path)
@@ -134,7 +181,7 @@ def main():
     target = np.stack([local_se3_delta(poses[a], poses[b]) for a, b in indices])
     device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device)
     report = dict(manifest=str(path.resolve()), axes=list(TARGET_NAMES),
-                  note='Validation splits reconstructed from saved seed/ratio; use the original training dataset. Rotation axes are rotvec components.',
+                  note='Validation episodes use saved IDs where available, otherwise the legacy seed/ratio split. Rotation axes are rotvec components.',
                   zero_motion_baseline=metrics(np.zeros_like(target), target), models={})
     with (args.output_dir / 'predictions.csv').open('w', newline='') as stream:
         writer = csv.writer(stream)

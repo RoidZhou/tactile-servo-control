@@ -102,7 +102,8 @@ def main() -> None:
         args.dataset_root, args.val_ratio, args.pairs_per_episode,
         args.target_limit, args.seed,
     )
-    print(json.dumps(info, indent=2))
+    print(json.dumps({key: value for key, value in info.items()
+                      if key not in ("train_episode_ids", "val_episode_ids")}, indent=2))
     train_loader = DataLoader(
         train_set, args.batch_size, shuffle=True, num_workers=args.num_workers,
         pin_memory=device.type == "cuda",

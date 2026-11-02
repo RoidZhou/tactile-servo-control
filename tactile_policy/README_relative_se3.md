@@ -1,3 +1,8 @@
+# 采集数据
+```bash
+python real_ur5rg2/collect_lerobot_xenstactile_contactline.py   --root real_ur5rg2/data/nut_relative_ou_no_fts   --num-episodes 100   --fps 20   --ou-frames 800   --no-collect-force   --no-force-safety --no-preview
+
+```
 # 成对触觉 SE(3) 模型
 
 `train_relative_se3.py` 使用 `--backbone` 选择特征提取网络，默认 `spatial`。
@@ -57,3 +62,19 @@ python tactile_policy/compare_relative_se3.py \
 
 比较时使用同一数据集、seed、验证比例与帧对清单。骨干实验同时改变了单手/双指
 特征融合方式和输入尺寸，应结合真实单位的逐轴误差判断效果。
+
+比较脚本默认选择 `relative_se3_200_217` 与 `relative_se3_200_217_resnet`。
+若比较其他模型，用 `--checkpoint` 显式传入实际权重。未传 `--dataset-root` 时，
+脚本使用各 checkpoint 内相同的训练数据集路径；若训练路径不同或数据迁移，
+需要显式传入该参数。启动时会打印当前数据集 episode 数量及各权重训练时的数量。
+
+新训练权重的 `dataset_info` 会保存实际 `train_episode_ids` 和 `val_episode_ids`。
+比较时优先取各权重已保存验证编号的交集，在原 episode 编号保持不变的数据追加后
+也能确定原验证 episode。旧权重只保存数量、seed 和比例，必须使用训练时原始数据集
+重建划分；不能在不同数量的数据上按相同 seed 重划分，否则可能把训练 episode
+当作验证 episode。
+
+如果提示 `Dataset episode count differs from training`，先核对 `--dataset-root`
+与 `--checkpoint` 是否指向同一次实验。例如，不要将 `relative_se3_100/200`
+旧权重与 `nut_relative_ou_217` 扩充数据集混用。数据集变化后应选择新的
+`--output-dir`，原 `validation_pairs.json` 的数据指纹仍会严格校验。

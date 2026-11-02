@@ -162,6 +162,9 @@ def load_pair_datasets(
         "episodes": len(unique_episodes), "train_episodes": len(unique_episodes) - n_val,
         "val_episodes": n_val, "loaded_unique_frames": len(selected_rows),
         "train_pairs": len(train_pairs), "val_pairs": len(val_pairs),
+        "train_episode_ids": sorted(int(value) for value in unique_episodes
+                                     if int(value) not in val_eps),
+        "val_episode_ids": sorted(int(value) for value in val_eps),
     }
     return (
         PairedTactileSE3Dataset(frames, poses, train_pairs, normalization),
