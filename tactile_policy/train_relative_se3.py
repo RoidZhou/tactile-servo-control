@@ -15,16 +15,25 @@ from torch.utils.data import DataLoader
 
 try:
     from .data_relative_se3 import TARGET_NAMES, load_pair_datasets
-    from .model import PairwiseTactileSE3Regressor
+    from .model import PAIRWISE_BACKBONES, create_pairwise_model
 except ImportError:
     from data_relative_se3 import TARGET_NAMES, load_pair_datasets
-    from model import PairwiseTactileSE3Regressor
+    from model import PAIRWISE_BACKBONES, create_pairwise_model
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", type=Path, default=Path("/media/zhou/Elements SE/YBZHOU/nut_relative_ou_217"))
-    parser.add_argument("--output-dir", type=Path, default=Path("tactile_policy/outputs/relative_se3_200_217"))
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Defaults to the original directory for spatial, or a backbone-specific directory.")
+    parser.add_argument("--backbone", choices=PAIRWISE_BACKBONES, default="spatial",
+                        help="spatial preserves the original four-hand model; others encode each bilateral frame.")
+    parser.add_argument("--feature-dim", type=int, default=128,
+                        help="Per-frame feature size for create_model backbones; unused by spatial.")
+    parser.add_argument("--grid-size", type=int, default=20,
+                        help="Square input grid for the FCN backbone.")
+    parser.add_argument("--image-size", type=int, default=128,
+                        help="Square input size for CNN/ResNet/ViT backbones; tokenizer uses its native grid.")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -41,6 +50,12 @@ def parse_args() -> argparse.Namespace:
         help="Normalization limits dx,dy,dz(m), drx,dry,drz(rad), matching OU limits.",
     )
     args = parser.parse_args()
+    for name in ("feature_dim", "grid_size", "image_size"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.output_dir is None:
+        suffix = "" if args.backbone == "spatial" else f"_{args.backbone}"
+        args.output_dir = Path(f"tactile_policy/outputs/relative_se3_200_217{suffix}")
     try:
         args.target_limit = np.asarray(
             [float(value) for value in args.target_limit.split(",")], dtype=np.float32
@@ -79,6 +94,10 @@ def main() -> None:
         "cuda" if args.device == "auto" and torch.cuda.is_available()
         else "cpu" if args.device == "auto" else args.device
     )
+    # Validate the architecture before loading the full dataset.
+    model = create_pairwise_model(
+        args.backbone, args.feature_dim, args.grid_size, args.image_size,
+    )
     train_set, val_set, normalization, info = load_pair_datasets(
         args.dataset_root, args.val_ratio, args.pairs_per_episode,
         args.target_limit, args.seed,
@@ -92,7 +111,8 @@ def main() -> None:
         val_set, args.batch_size, shuffle=False, num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    model = PairwiseTactileSE3Regressor().to(device)
+    model = model.to(device)
+    print(f"Model: {model.model_type} config={model.model_config}", flush=True)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
     )
@@ -135,7 +155,9 @@ def main() -> None:
             best, stale = val_loss, 0
             torch.save({
                 "model_state_dict": model.state_dict(),
-                "model_type": "pairwise_tactile_se3",
+                "model_type": model.model_type,
+                "model_config": model.model_config,
+                "epoch": epoch,
                 "normalization": normalization.as_dict(),
                 "target_names": TARGET_NAMES,
                 "transform_convention": "inv(T_world_tcp_1) @ T_world_tcp_2; local xyz + rotvec",

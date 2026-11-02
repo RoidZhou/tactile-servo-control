@@ -1,5 +1,13 @@
 """Tactile policies for fingertip pose estimation."""
 
-from .model import MODEL_TYPES, TactilePoseCNN, create_model
+from .model import (
+    MODEL_TYPES, PAIRWISE_BACKBONES, PAIRWISE_MODEL_TYPES, TactilePoseCNN,
+    PairwiseTactileSE3Regressor, PairwiseBackboneSE3Regressor,
+    create_model, create_pairwise_model, load_pairwise_model,
+)
 
-__all__ = ["MODEL_TYPES", "TactilePoseCNN", "create_model"]
+__all__ = [
+    "MODEL_TYPES", "PAIRWISE_BACKBONES", "PAIRWISE_MODEL_TYPES", "TactilePoseCNN",
+    "PairwiseTactileSE3Regressor", "PairwiseBackboneSE3Regressor",
+    "create_model", "create_pairwise_model", "load_pairwise_model",
+]

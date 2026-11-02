@@ -533,13 +533,10 @@ def load_model(path: Path, device: torch.device):
         path.expanduser().resolve(), map_location=device, weights_only=False
     )
     model_type = checkpoint.get("model_type", "simple_cnn")
-    if model_type == "pairwise_tactile_se3":
-        from tactile_policy.model import PairwiseTactileSE3Regressor
+    if model_type in ("pairwise_tactile_se3", "pairwise_backbone_se3"):
+        from tactile_policy.model import load_pairwise_model
         from tactile_policy.data_relative_se3 import PairNormalization
-        model = PairwiseTactileSE3Regressor().to(device)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-        model.eval()
-        model.tactile_input_kind = "paired_force"
+        model = load_pairwise_model(checkpoint, device)
         norm = PairNormalization(**{
             key: np.asarray(checkpoint["normalization"][key], dtype=np.float32)
             for key in ("input_mean", "input_std", "target_limit")

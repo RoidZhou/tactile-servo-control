@@ -14,10 +14,10 @@ from scipy.spatial.transform import Rotation
 
 try:
     from .data_relative_se3 import LEFT_KEY, RIGHT_KEY, TCP_KEY, TARGET_NAMES, _force_to_chw, local_se3_delta, signed_log1p
-    from .model import PairwiseTactileSE3Regressor
+    from .model import PAIRWISE_MODEL_TYPES, load_pairwise_model
 except ImportError:
     from data_relative_se3 import LEFT_KEY, RIGHT_KEY, TCP_KEY, TARGET_NAMES, _force_to_chw, local_se3_delta, signed_log1p
-    from model import PairwiseTactileSE3Regressor
+    from model import PAIRWISE_MODEL_TYPES, load_pairwise_model
 
 SCALE = np.array([1000.] * 3 + [180 / np.pi] * 3)
 
@@ -61,8 +61,8 @@ def main():
         parser.error('--names must contain one unique name per checkpoint')
     checkpoints = [torch.load(p, map_location='cpu', weights_only=False) for p in args.checkpoint]
     for cp in checkpoints:
-        if cp.get('model_type') != 'pairwise_tactile_se3':
-            raise ValueError('Only pairwise_tactile_se3 checkpoints are supported')
+        if cp.get('model_type') not in PAIRWISE_MODEL_TYPES:
+            raise ValueError('Only paired SE3 checkpoints are supported')
         if cp.get('transform_convention') != 'inv(T_world_tcp_1) @ T_world_tcp_2; local xyz + rotvec':
             raise ValueError('Unsupported or missing checkpoint transform convention')
 
@@ -144,9 +144,7 @@ def main():
             mean, std, limit = [np.asarray(norm[k], dtype=np.float32) for k in ('input_mean','input_std','target_limit')]
             if any(x.shape != (6,) or not np.isfinite(x).all() for x in (mean,std,limit)) or np.any(std<=0) or np.any(limit<=0):
                 raise ValueError('Invalid checkpoint normalization')
-            model = PairwiseTactileSE3Regressor().to(device)
-            model.load_state_dict(cp['model_state_dict'], strict=True)
-            model.eval()
+            model = load_pairwise_model(cp, device)
             outputs = []
             with torch.inference_mode():
                 for start in range(0, len(local), args.batch_size):
@@ -158,6 +156,8 @@ def main():
                 raise ValueError(f'Nonfinite predictions: {name}')
             result = metrics(pred,target)
             result['checkpoint'] = str(checkpoint_path.resolve())
+            result['model_type'] = model.model_type
+            result['model_config'] = model.model_config
             result['target_out_of_range_fraction'] = (np.abs(target)>limit).mean(0).tolist()
             result['by_episode'] = {str(e): metrics(pred[pairs[:,0]==e], target[pairs[:,0]==e]) for e in np.unique(pairs[:,0])}
             report['models'][name] = result

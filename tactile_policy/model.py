@@ -10,6 +10,8 @@ MODEL_TYPES = (
     "fcn", "simple_cnn", "posenet_cnn", "nature_cnn", "resnet", "vit",
     "tactile_tokenizer",
 )
+PAIRWISE_BACKBONES = ("spatial",) + MODEL_TYPES
+PAIRWISE_MODEL_TYPES = ("pairwise_tactile_se3", "pairwise_backbone_se3")
 
 
 def reference_weight_init(module: nn.Module) -> None:
@@ -397,6 +399,91 @@ def create_model(model_type: str, in_channels: int = 6, output_dim: int = 6,
     else:
         raise ValueError(f"Unknown model type {model_type!r}; choose from {MODEL_TYPES}")
     return ResizeInput(core, image_size)
+
+
+class PairwiseBackboneSE3Regressor(nn.Module):
+    """Shared bilateral-frame encoder from create_model, followed by an SE(3) head.
+
+    Each [6,H,W] frame contains left XYZ then right XYZ. The backbone's output
+    layer projects to a learned feature vector, rather than directly to pose.
+    Reference and current features are concatenated in that order. Inputs and
+    normalized outputs follow the original PairwiseTactileSE3Regressor contract.
+    """
+
+    def __init__(self, backbone: str = "resnet", feature_dim: int = 128,
+                 grid_size: int = 20, image_size: int = 128) -> None:
+        super().__init__()
+        if backbone not in MODEL_TYPES:
+            raise ValueError(f"Unknown paired backbone {backbone!r}; choose from {MODEL_TYPES}")
+        for name, value in (("feature_dim", feature_dim), ("grid_size", grid_size),
+                            ("image_size", image_size)):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if backbone == "vit" and image_size % 32:
+            raise ValueError("ViT image_size must be a multiple of its 32-pixel patch size")
+        if backbone in ("simple_cnn", "nature_cnn"):
+            minimum = 38 if backbone == "simple_cnn" else 36
+            if image_size < minimum:
+                raise ValueError(f"{backbone} image_size must be at least {minimum}")
+        self.model_type = "pairwise_backbone_se3"
+        self.model_config = dict(backbone=backbone, feature_dim=feature_dim,
+                                 grid_size=grid_size, image_size=image_size)
+        self.tactile_input_kind = "paired_force"
+        self.encoder = create_model(backbone, in_channels=6, output_dim=feature_dim,
+                                    grid_size=grid_size, image_size=image_size)
+        if backbone == "fcn":
+            # FCN has a fixed flattened input; use its grid_size, not image_size.
+            self.encoder = ResizeInput(self.encoder, grid_size)
+        elif backbone == "resnet":
+            # Only this new feature encoder uses adaptive pooling. Existing
+            # create_model callers retain their original fixed-pool behavior.
+            self.encoder.model.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Linear(2 * feature_dim, 512), nn.ELU(inplace=True), nn.Dropout(0.15),
+            nn.Linear(512, 512), nn.ELU(inplace=True), nn.Dropout(0.15),
+            nn.Linear(512, 256), nn.ELU(inplace=True),
+            nn.Linear(256, 6), nn.Tanh(),
+        )
+
+    def forward(self, tactile_pair: torch.Tensor) -> torch.Tensor:
+        if tactile_pair.ndim != 5 or tactile_pair.shape[1:3] != (2, 6):
+            raise ValueError(f"Expected [B,2,6,H,W], got {tuple(tactile_pair.shape)}")
+        batch, _, channels, height, width = tactile_pair.shape
+        # Encode both times together: shared weights and >=2 encoder samples
+        # even for a final training batch of one (FCN uses BatchNorm1d).
+        features = self.encoder(tactile_pair.reshape(batch * 2, channels, height, width))
+        return self.head(features.reshape(batch, -1))
+
+
+def create_pairwise_model(backbone: str = "spatial", feature_dim: int = 128,
+                          grid_size: int = 20, image_size: int = 128) -> nn.Module:
+    """Keep the original four-hand encoder as the default paired model."""
+    if backbone == "spatial":
+        model = PairwiseTactileSE3Regressor()
+        model.model_type = "pairwise_tactile_se3"
+        model.model_config = {}
+        model.tactile_input_kind = "paired_force"
+        return model
+    return PairwiseBackboneSE3Regressor(backbone, feature_dim, grid_size, image_size)
+
+
+def load_pairwise_model(checkpoint: dict, device="cpu") -> nn.Module:
+    """Rebuild a paired model strictly, including legacy checkpoints without config."""
+    model_type = checkpoint.get("model_type")
+    if model_type == "pairwise_tactile_se3":
+        model = create_pairwise_model()
+    elif model_type == "pairwise_backbone_se3":
+        config = checkpoint.get("model_config")
+        if (not isinstance(config, dict)
+                or set(config) != {"backbone", "feature_dim", "grid_size", "image_size"}
+                or config["backbone"] not in MODEL_TYPES):
+            raise ValueError("Backbone checkpoint requires a complete, valid model_config")
+        model = create_pairwise_model(**config)
+    else:
+        raise ValueError(f"Unsupported paired model type: {model_type!r}")
+    model = model.to(device)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    return model.eval()
 
 
 class TactilePoseCNN(nn.Module):
