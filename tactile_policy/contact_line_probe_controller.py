@@ -69,7 +69,7 @@ class ProbeConfig:
     settle_s: float = 1.
     ramp_s: float = 3.
     rock_period_s: float = 20.
-    rock_cycles: int = 2
+    rock_cycles: float = 1.25
     follow_s: float = 20.
     release_s: float = 3.
     release_timeout_s: float = 8.
@@ -118,10 +118,11 @@ class ProbeConfig:
                 continue
             if value < 0 or (value == 0 and item.name not in nonnegative):
                 raise ValueError(item.name + ' must be positive')
-        for name in ('rock_cycles', 'min_line_samples'):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool):
-                raise ValueError(name + ' must be an integer')
+        if self.rock_cycles <= 0:
+            raise ValueError('rock_cycles must be positive')
+        value = self.min_line_samples
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError('min_line_samples must be an integer')
         if abs(self.normal_target_m) > self.max_normal_translation_m:
             raise ValueError('normal target exceeds normal travel limit')
 
@@ -258,8 +259,9 @@ class ProbeController:
         c = self.config
         desired = np.zeros(6)
         if self.stage == 'ramp':
-            desired[2] = c.normal_target_m * _smooth(self.elapsed / c.ramp_s)
-            desired[3] = c.angle_x_rad * _smooth(self.elapsed / c.ramp_s)
+            progress = np.clip(self.elapsed / c.ramp_s, 0., 1.)
+            desired[2] = c.normal_target_m * progress
+            desired[3] = c.angle_x_rad * progress
         elif self.stage == 'rock':
             phase = 2 * np.pi * self.elapsed / c.rock_period_s
             desired[2] = c.normal_target_m

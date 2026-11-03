@@ -41,8 +41,8 @@ def add_probe_arguments(parser):
         'reference-stable-s': 1., 'reference-timeout-s': 15.,
         'reference-position-mm': .1, 'reference-angle-deg': .1, 'reference-force-n': .2,
         'contact-change-n': .5, 'contact-release-n': .25, 'contact-loss-s': .3,
-        'ramp-s': 3., 'rock-period-s': 20., 'deformation-roll-deg': .3,
-        'deformation-pitch-deg': .2, 'normal-deformation-mm': 0.,
+        'ramp-s': 5., 'rock-period-s': 20., 'deformation-roll-deg': 1.,
+        'deformation-pitch-deg': .6, 'normal-deformation-mm': 0., 'rock-cycles': 1.25,
         'follow-s': 20., 'release-s': 3., 'release-timeout-s': 8.,
         'translation-gain': 1., 'rotation-gain': 1.,
         'max-speed-mm-s': 1., 'max-speed-deg-s': .5,
@@ -119,7 +119,7 @@ def validate_probe_arguments(parser, args):
 def make_controller_config(a):
     return ProbeConfig(
         settle_s=a.contact_line_reference_stable_s, ramp_s=a.contact_line_ramp_s,
-        rock_period_s=a.contact_line_rock_period_s, rock_cycles=a.contact_line_probe_cycles,
+        rock_period_s=a.contact_line_rock_period_s, rock_cycles=a.contact_line_rock_cycles,
         follow_s=a.contact_line_follow_s, release_s=a.contact_line_release_s,
         release_timeout_s=a.contact_line_release_timeout_s,
         angle_x_rad=np.deg2rad(a.contact_line_deformation_roll_deg),

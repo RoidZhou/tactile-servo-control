@@ -1,6 +1,6 @@
 # 接触线反馈探测
 
-保留现有双帧 SE(3) 模型。默认 `--contact-line-strategy feedback` 使用同步帧、触觉形变反馈 rocking、表面接触线有效性检查，然后在接触线连续稳定后沿线摆动。默认形变目标为 roll 0.3°、pitch 0.2°；实际 TCP 运动受速度、加速度、单步和相对初始姿态最大 4°约束。形变反馈不等同于恒力控制。
+保留现有双帧 SE(3) 模型。默认 `--contact-line-strategy feedback` 使用同步帧、触觉形变反馈 rocking、表面接触线有效性检查，然后在接触线连续稳定后沿线摆动。探测轨迹参考原项目：先在 5 秒内将 roll 目标渐增到 1°，再按 20 秒周期做 roll 1°、pitch 0.6° 的椭圆 rocking，默认持续 1.25 周期；无有效线时平滑释放。实际 TCP 仍受速度、加速度、单步和相对初始姿态最大 4°约束，法向总位移默认限 1 mm。形变反馈不等同于恒力控制。
 
 ## 标准位置与接触平面
 
@@ -39,9 +39,9 @@ python tactile_policy/infer_tactile_servo_nutbolt_contact_line.py \
 
 左右帧捕获时间差默认不超过 20 ms；同时检查帧龄和 TCP 插值时间范围。重复帧、失去同步或时钟回跳不会被当作新测量继续积分。TCP 缓存轮询目标为 100 Hz，模型/控制默认 20 Hz；实际频率取决于通信与推理延迟。
 
-表面估计器允许平面内滑动，检查法向激励、公共线可观测性、原始平面残差和求解时间。几何有效不等于外部接触已被独立证实。至少完成一周期 rocking，且接触线连续稳定后才进入 follow；follow 中线过时或失效会停止。正常结束时将形变目标平滑归零，不直接回初始 TCP。
+表面估计器允许平面内滑动，检查法向激励、公共线可观测性、原始平面残差和求解时间。几何有效不等于外部接触已被独立证实。默认至少完成一周期 rocking，且接触线连续稳定后才进入 follow；rocking 总时长由 `--contact-line-rock-cycles` 控制，支持小数周期。follow 中线过时或失效会停止。正常结束时将形变目标平滑归零，不直接回初始 TCP。
 
-默认写入 `tactile_policy/logs/contact_line_probe.csv` 与同名 `.metadata.json`，记录同步时间差、形变目标与误差、当前/指令 TCP、接触依据、线有效性和退化原因。`--contact-line-no-follow` 可只采集反馈 rocking；`--contact-line-strategy waypoints --contact-line-estimator svd` 可使用旧航点探测用于对比。
+默认反馈 rocking 幅值为 roll 1°、pitch 0.6°，周期 20 秒、1.25 周期；可用 `--contact-line-deformation-roll-deg`、`--contact-line-deformation-pitch-deg`、`--contact-line-rock-period-s` 和 `--contact-line-rock-cycles` 覆盖。反馈点仍使用本项目当前 TCP 到螺母中心的配置；原项目的 `l_approx=54.5 mm` 定义在 ABB 的 cart/TCP 偏置坐标中，不可直接当作 UR5 TCP 偏移复用。默认写入 `tactile_policy/logs/contact_line_probe.csv` 与同名 `.metadata.json`，记录同步时间差、形变目标与误差、当前/指令 TCP、接触依据、线有效性和退化原因。`--contact-line-no-follow` 可只采集反馈 rocking；`--contact-line-strategy waypoints --contact-line-estimator svd` 可使用旧航点探测用于对比。
 
 力变化接触判断采用迟滞：`--contact-line-contact-change-n` 默认 0.5 N，用于建立接触依据；`--contact-line-contact-release-n` 默认 0.25 N，用于建立后的维持判断，必须小于前者。弱依据期间立即暂停命令；至少 3 个连续新帧且捕获时间跨度达到 `--contact-line-contact-loss-s`（默认 0.3 秒）才报丢失。超过 0.2 秒的采样间隔会重新开始连续低值计数，缺帧仍由原有同步/反馈超时检查处理。该迟滞减少阈值附近的反复切换，不代表能独立证明螺母没有脱离螺栓。
 

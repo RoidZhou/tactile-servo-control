@@ -52,6 +52,9 @@ class RuntimeTests(unittest.TestCase):
         args = parse_entry_args(MANUAL)
         self.assertEqual(args.contact_line_plane_point_mm, [0., 0., 100.])
         self.assertEqual(args.contact_line_plane_point_source, 'standard_tcp_to_nut_center_approximation')
+        self.assertEqual(args.contact_line_deformation_roll_deg, 1.)
+        self.assertEqual(args.contact_line_deformation_pitch_deg, .6)
+        self.assertEqual(args.contact_line_rock_cycles, 1.25)
         args = parse_entry_args(MANUAL + ['--standard-tcp-to-nut-center', '0.001,-0.002,0.12'])
         np.testing.assert_allclose(args.contact_line_plane_point_mm, [1., -2., 120.])
 
