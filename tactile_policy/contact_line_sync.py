@@ -88,8 +88,9 @@ class SynchronizedProbeSource:
             raise ValueError("RTDE state timestamp is in the future")
         epoch = observation.get("rtde_clock_epoch")
         if self._epoch_seen and epoch != self.clock_epoch:
+            previous_epoch = self.clock_epoch
             self.states.clear()
-            self._unavailable("RTDE clock epoch changed; reset required", True)
+            self._unavailable("RTDE clock epoch changed ({} -> {}); reset required".format(previous_epoch, epoch), True)
             return self.last_reason
         self.clock_epoch, self._epoch_seen = epoch, True
         native = observation.get("rtde_timestamp")
@@ -98,15 +99,27 @@ class SynchronizedProbeSource:
             if not np.isfinite(native):
                 raise ValueError("invalid native RTDE timestamp")
             if self.last_native is not None and native < self.last_native:
+                previous_native = self.last_native
                 self.states.clear()
-                self._unavailable("native RTDE clock moved backwards; reset required", True)
+                self._unavailable("native RTDE clock moved backwards ({:.9f} -> {:.9f}); reset required".format(
+                    previous_native, native), True)
                 return self.last_reason
+            if self.last_native is not None and native == self.last_native:
+                # Same controller packet, not a new state. URRobot converts the
+                # cached monotonic stamp to wall time on each RPC; rounding or
+                # wall/monotonic read jitter can move that value slightly. Keep
+                # the first accepted pose/time, without consuming tactile frames
+                # or treating a recomputed timestamp as controller progress.
+                return "duplicate RTDE snapshot"
         if self.states and stamp < self.states[-1][0]:
+            previous_stamp = self.states[-1][0]
             self.states.clear()
-            self._unavailable("mapped RTDE clock moved backwards; reset required", True)
+            self._unavailable(("mapped RTDE clock moved backwards ({:.9f} -> {:.9f}, delta={:.6f}ms, "
+                               "native {} -> {}); reset required").format(
+                                   previous_stamp, stamp, (stamp-previous_stamp)*1000,
+                                   self.last_native, native), True)
             return self.last_reason
-        if self.states and (stamp == self.states[-1][0]
-                            or (native is not None and native == self.last_native)):
+        if self.states and stamp == self.states[-1][0]:
             return "duplicate RTDE snapshot"
         self.states.append((stamp, tcp.copy()))
         self.last_native = native
