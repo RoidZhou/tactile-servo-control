@@ -57,6 +57,7 @@ from gello.force.robotiq_fts300 import (
 )
 from tactile_policy.data import Normalization, signed_log1p
 from tactile_policy.model import create_model
+from tactile_policy.contact_line_runtime import add_probe_arguments, validate_probe_arguments
 
 
 XENSE_LEFT_SERIAL = "OG001783"
@@ -125,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--right-tactile-port", type=int, default=5101)
     parser.add_argument("--tactile-timeout-ms", type=int, default=15000)
     parser.add_argument(
-        "--tactile-sync-max-skew-ms", type=float, default=100.0,
+        "--tactile-sync-max-skew-ms", type=float, default=20.0,
         help="Maximum left/right capture-time difference for contact-line inference (ms).",
     )
     parser.add_argument("--xense-force-height", type=int, default=XENSE_FORCE_HEIGHT)
@@ -325,7 +326,7 @@ def parse_args() -> argparse.Namespace:
         "--contact-line-window", type=int, default=80,
         help="Maximum number of synchronized pose estimates in the fitting window.",
     )
-    parser.add_argument("--contact-line-estimator", choices=("svd", "factor-graph"), default="svd")
+    parser.add_argument("--contact-line-estimator", choices=("svd", "factor-graph", "surface"), default=None)
     parser.add_argument("--contact-line-position-sigma-mm", type=float, default=0.5)
     parser.add_argument("--contact-line-rotation-sigma-deg", type=float, default=0.5)
     parser.add_argument("--contact-line-contact-sigma-mm", type=float, default=0.2)
@@ -342,6 +343,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("tactile_policy/logs/contact_line_probe.csv"),
         help="CSV output for synchronized observations and contact-line estimates.",
     )
+    add_probe_arguments(parser)
 
     parser.add_argument(
         "--use-force-safety",
@@ -510,6 +512,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--contact-line-factor-graph-every must be positive")
     if args.contact_line_factor_graph_max_nfev <= 0:
         parser.error("--contact-line-factor-graph-max-nfev must be positive")
+    validate_probe_arguments(parser, args)
     axis_norm = float(np.linalg.norm(args.bolt_axis_base))
     if axis_norm < 1e-9:
         parser.error("--bolt-axis-base must be nonzero")
@@ -547,6 +550,9 @@ def load_model(path: Path, device: torch.device):
                            (norm.input_mean, norm.input_std, norm.target_limit))
                 or np.any(norm.input_std <= 0) or np.any(norm.target_limit <= 0)):
             raise ValueError("Invalid paired-model normalization")
+        print(f"Loaded paired checkpoint={path.expanduser().resolve()} "
+              f"model_type={model_type} config={checkpoint.get('model_config')} "
+              f"epoch={checkpoint.get('epoch')} target_limit={norm.target_limit.tolist()}", flush=True)
         return model, norm
     # 新增：仅深度 checkpoint 进入新分支，其他模型保留原 create_model 路径。
     if model_type == "native_depth_cnn":
@@ -1246,7 +1252,7 @@ def _fresh_tactile_timestamp(left: dict, right: dict) -> tuple[float, float]:
     return stamps
 
 
-def prepare_contact_line_probe(args, robot, tactile, force_reader, model, norm, device) -> None:
+def prepare_contact_line_probe(args, robot, tactile, force_reader, model, norm, device) -> dict:
     """Close at the current grasp, transport above the bolt, then find contact.
 
     Unlike full-cycle this mode assumes the open gripper is already positioned
@@ -1318,6 +1324,10 @@ def prepare_contact_line_probe(args, robot, tactile, force_reader, model, norm, 
     command_pose(robot, descent_state["last_command"], args.execute)
     checked_wait(min(1.0, args.gripper_settle_s))
     print("[contact-line] External contact latched; starting active probe.", flush=True)
+    return {
+        "free_grasp_forces_n": descent_state["free_grasp_forces_n"].copy(),
+        "contact_detection": "tactile_change_inside_calibrated_height_window",
+    }
 
 
 def paired_force_input(left, right):
@@ -1348,6 +1358,20 @@ def inferred_object_frame(actual, relative_motion):
 
 
 def run_contact_line_probe(args, robot, tactile, force_reader, model, norm, device) -> None:
+    if args.contact_line_strategy == "waypoints":
+        return run_contact_line_waypoint_probe(args, robot, tactile, force_reader, model, norm, device)
+    from tactile_policy.contact_line_runtime import run_feedback_probe
+    from types import SimpleNamespace
+    api = SimpleNamespace(
+        load_model=load_model, prepare_contact_line_probe=prepare_contact_line_probe,
+        paired_force_input=paired_force_input, predict_pair_motion=predict_pair_motion,
+        inferred_object_frame=inferred_object_frame, format_tactile_frame=format_tactile_frame,
+        check_safety=check_safety, command_pose=command_pose, SafetyStop=SafetyStop,
+    )
+    return run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, api)
+
+
+def run_contact_line_waypoint_probe(args, robot, tactile, force_reader, model, norm, device) -> None:
     """Actively rock a grasped nut and estimate its stationary contact line.
 
     This first version deliberately only reports the estimate.  It never feeds
@@ -2082,6 +2106,7 @@ def run_descent_servo(
     print("descent: tactile change latched; handing off to screw controller.", flush=True)
     return screw_p, {
         "estimated_offset": estimated_offset.copy(),
+        "free_grasp_forces_n": grip_baseline.copy(),
         "filtered_dp": screw_dp,
         "filtered_drot": screw_drot,
         "last_command": last_command.copy(),
@@ -3064,6 +3089,9 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
     model, norm = load_model(args.checkpoint, device)
+    if (args.mode == "contact-line-probe" and args.contact_line_strategy == "feedback"
+            and getattr(model, "tactile_input_kind", "") != "paired_force"):
+        raise ValueError("Feedback probing requires a paired relative SE3 checkpoint via --checkpoint")
     if getattr(model, "tactile_input_kind", "") == "paired_force":
         if args.mode != "contact-line-probe":
             raise ValueError("Paired SE3 checkpoint currently supports --mode contact-line-probe")
