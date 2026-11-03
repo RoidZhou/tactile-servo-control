@@ -409,6 +409,9 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                 # Poll actual robot history faster than inference. No shared ZMQ sockets.
                 sample = source.poll()
                 if source.clock_fault:
+                    metadata['synchronization_fault'] = dict(reason=source.last_reason,
+                                                              diagnostics=source.last_diagnostics)
+                    log_event('clock_fault', source.last_reason, status='stopped')
                     raise api.SafetyStop('capture/RTDE clock fault: ' + source.last_reason)
                 if sample is None:
                     if tick-last_valid > args.contact_line_missing_timeout_s:
