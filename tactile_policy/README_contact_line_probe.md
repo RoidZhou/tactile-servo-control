@@ -1,0 +1,46 @@
+# 接触线反馈探测
+
+保留现有双帧 SE(3) 模型。默认 `--contact-line-strategy feedback` 使用同步帧、触觉形变反馈 rocking、表面接触线有效性检查，然后在接触线连续稳定后沿线摆动。默认形变目标为 roll 0.3°、pitch 0.2°；实际 TCP 运动受速度、加速度、单步和相对初始姿态最大 4°约束。形变反馈不等同于恒力控制。
+
+## 标准位置与接触平面
+
+按当前项目的标准设置，未传 `--contact-line-plane-point-mm` 时，程序读取 `--standard-tcp-to-nut-center` 并将米转换为毫米。当前标准值 `[0, 0, 0.100] m` 对应默认平面点 `[0, 0, 100] mm`，法向默认 `[0, 0, 1]`。如果修改标准偏移，默认平面点随之更新。
+
+这是按标准螺母中心位置近似接触平面。代码没有单独的螺母厚度或底面偏移标定，因此该默认值不表示实际底面已经完成标定；这个偏差会影响接触线的位置精度。启动日志与 metadata 会记录 `standard_tcp_to_nut_center_approximation`。显式传入 `--contact-line-plane-point-mm X Y Z` 时，以该值为准，记录 `explicit_plane_point_mm`。
+
+点和法向均使用探测参考 TCP 的局部坐标系，位置单位为毫米，不能填写机器人基座坐标。程序利用实际 TCP 姿态转换到基座系。`--bolt-contact-tcp-pose` 是机器人 TCP 的基座位姿，继续用于原有准备/下降流程，不是该平面的局部坐标。
+
+## 运行
+
+如果螺母已夹持并已与螺栓顶部/边缘建立轻接触：
+
+```bash
+python tactile_policy/infer_tactile_servo_nutbolt_contact_line.py \
+  --mode contact-line-probe \
+  --checkpoint tactile_policy/outputs/relative_se3_200_217/best_model.pt \
+  --no-contact-line-auto-prepare \
+  --contact-line-contact-established
+```
+
+不传 `--execute` 时只做现有观察检查。实际执行在相同命令后添加 `--execute`，程序保留原有 RUN 确认。`--contact-line-contact-established` 表示操作者确认当前存在外部接触；日志会注明这是人工依据。也可以传 `--contact-line-free-grasp-forces-n LEFT RIGHT`，用相同夹持条件下、接触螺栓前的双侧力范数作为基准，持续检查力变化。该力变化判断是启发式接触依据。
+
+需要自动夹持、搬运和下降时，使用原有绝对位姿模型作为准备模型：
+
+```bash
+python tactile_policy/infer_tactile_servo_nutbolt_contact_line.py \
+  --mode contact-line-probe \
+  --checkpoint tactile_policy/outputs/relative_se3_200_217/best_model.pt \
+  --preparation-checkpoint /path/to/absolute_pose/best_model.pt
+```
+
+准备流程保留原来的标准抓取、螺栓接触 TCP 位姿和高度窗口，下降前测得的自由夹持力基准交给新探测流程。上面的准备模型路径需要换成实际文件。
+
+## 有效性与记录
+
+左右帧捕获时间差默认不超过 20 ms；同时检查帧龄和 TCP 插值时间范围。重复帧、失去同步或时钟回跳不会被当作新测量继续积分。TCP 缓存轮询目标为 100 Hz，模型/控制默认 20 Hz；实际频率取决于通信与推理延迟。
+
+表面估计器允许平面内滑动，检查法向激励、公共线可观测性、原始平面残差和求解时间。几何有效不等于外部接触已被独立证实。至少完成一周期 rocking，且接触线连续稳定后才进入 follow；follow 中线过时或失效会停止。正常结束时将形变目标平滑归零，不直接回初始 TCP。
+
+默认写入 `tactile_policy/logs/contact_line_probe.csv` 与同名 `.metadata.json`，记录同步时间差、形变目标与误差、当前/指令 TCP、接触依据、线有效性和退化原因。`--contact-line-no-follow` 可只采集反馈 rocking；`--contact-line-strategy waypoints --contact-line-estimator svd` 可使用旧航点探测用于对比。
+
+新增控制、同步与表面估计已通过离线单元测试；实际机器人行为和接触线精度仍需实机验证。

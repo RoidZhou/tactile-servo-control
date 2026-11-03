@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from tactile_policy.contact_line_probe_controller import (
-    ProbeConfig, ProbeController, ProbeControlError, _transform, _inverse, _pose,
+    ProbeConfig, ProbeController, _transform, _inverse, _pose,
 )
 from tactile_policy.contact_line_surface import SurfaceContactLineEstimator
 from tactile_policy.contact_line_sync import SynchronizedProbeSource
@@ -24,7 +24,7 @@ def add_probe_arguments(parser):
     group = parser.add_argument_group('Feedback contact-line probe (SI internally)')
     group.add_argument('--contact-line-strategy', choices=('feedback', 'waypoints'), default='feedback')
     group.add_argument('--contact-line-plane-point-mm', nargs=3, type=float, default=None,
-                       help='Calibrated point on nut bottom in initial-reference TCP axes, mm.')
+                       help='Point on nut bottom relative to reference TCP, mm. Defaults to standard-tcp-to-nut-center converted from m, as a nominal contact-plane approximation.')
     group.add_argument('--contact-line-plane-normal', nargs=3, type=float, default=[0., 0., 1.],
                        help='Nut-bottom normal in initial-reference TCP axes; sign defines feedback +z.')
     group.add_argument('--contact-line-feedback-point-mm', nargs=3, type=float, default=None,
@@ -70,7 +70,13 @@ def validate_probe_arguments(parser, args):
     if args.contact_line_estimator != 'surface':
         parser.error('feedback probing requires --contact-line-estimator surface')
     if args.contact_line_plane_point_mm is None:
-        parser.error('feedback probing requires --contact-line-plane-point-mm X Y Z (calibrated nut bottom)')
+        # User-selected standard geometry. The center offset is an explicit
+        # approximation of the contact plane, not a new bottom calibration.
+        args.contact_line_plane_point_mm = (
+            np.asarray(args.standard_tcp_to_nut_center, dtype=float) * 1000).tolist()
+        args.contact_line_plane_point_source = 'standard_tcp_to_nut_center_approximation'
+    else:
+        args.contact_line_plane_point_source = 'explicit_plane_point_mm'
     for name in ('plane_point_mm', 'plane_normal', 'feedback_point_mm', 'free_grasp_forces_n'):
         value = getattr(args, 'contact_line_' + name)
         if value is not None and not np.isfinite(value).all():
@@ -84,8 +90,10 @@ def validate_probe_arguments(parser, args):
         parser.error('manual preparation requires free-grasp force baseline or --contact-line-contact-established')
     for name, value in vars(args).items():
         if name.startswith('contact_line_') and isinstance(value, float):
-            if not np.isfinite(value) or (value <= 0 and name != 'contact_line_normal_deformation_mm'
-                                         and name != 'contact_line_hold_s'):
+            allow_zero = name in ('contact_line_hold_s', 'contact_line_deformation_roll_deg',
+                                  'contact_line_deformation_pitch_deg')
+            signed = name == 'contact_line_normal_deformation_mm'
+            if not np.isfinite(value) or (not signed and (value < 0 or (value == 0 and not allow_zero))):
                 parser.error(name.replace('_', '-') + ' must be positive and finite')
     if not np.isfinite(args.control_hz) or not 1 <= args.control_hz <= 100:
         parser.error('feedback control-hz must be in [1,100]')
@@ -97,6 +105,8 @@ def validate_probe_arguments(parser, args):
         parser.error('sample max age must be shorter than missing-sample timeout')
     if args.contact_line_max_rotation_deg > 4 or args.contact_line_min_observability <= 1:
         parser.error('max-rotation-deg must be <=4 and min-observability must exceed 1')
+    if args.contact_line_deformation_roll_deg == 0 and args.contact_line_deformation_pitch_deg == 0:
+        parser.error('feedback rocking requires a nonzero roll or pitch deformation amplitude')
     try:
         make_controller_config(args)
         make_estimator(args)
@@ -284,13 +294,16 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
         fields += [prefix + '_' + axis for axis in ('x', 'y', 'z', 'rx', 'ry', 'rz')]
     fields += ['line_' + name + '_' + axis for name in ('point', 'direction') for axis in ('x', 'y', 'z')]
     started = time.monotonic()
+    wall_offset = time.time() - started
     last_valid, last_step, last_print = started, -np.inf, -np.inf
+    last_control_valid = started
     controller = reference = reference_self = None
     loss_since = None
     count = 0
     worker = LatestEstimateWorker(estimator)
     print('[contact-line] feedback: stable reference -> ramp -> rocking -> qualified line follow -> release', flush=True)
     print('[contact-line] bottom plane (mm), normal:', args.contact_line_plane_point_mm, args.contact_line_plane_normal, flush=True)
+    print('[contact-line] plane source:', args.contact_line_plane_point_source, flush=True)
     print('[contact-line] CSV:', output, '; metadata:', meta_path, flush=True)
     try:
         with output.open('w', newline='', encoding='utf-8') as handle:
@@ -298,8 +311,12 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
             writer.writeheader()
             while True:
                 tick = time.monotonic()
+                if abs((time.time()-tick)-wall_offset) > .05:
+                    raise api.SafetyStop('host wall/monotonic clock mapping changed during probe')
                 if controller is None and tick-started > args.contact_line_reference_timeout_s:
                     raise api.SafetyStop('stable synchronized contact reference timeout: ' + source.last_reason)
+                if controller is not None and tick-last_control_valid > args.contact_line_missing_timeout_s:
+                    raise api.SafetyStop('no fresh completed feedback inference within timeout')
                 # Poll actual robot history faster than inference. No shared ZMQ sockets.
                 sample = source.poll()
                 if source.clock_fault:
@@ -330,6 +347,7 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                         loss_since = last_valid if loss_since is None else loss_since
                         if last_valid-loss_since >= args.contact_line_contact_loss_s:
                             raise api.SafetyStop('external-contact force-change evidence lost')
+                    time.sleep(max(0., 1/args.contact_line_poll_hz-(time.monotonic()-tick)))
                     continue
                 loss_since = None
                 tcp = sample['tcp']
@@ -341,6 +359,7 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                     if not np.isfinite(reference_self).all() or np.any(np.abs(reference_self) >= .25*target_limit):
                         raise api.SafetyStop('reference self-prediction too large; check model/preprocessing')
                     controller = ProbeController(config, tcp, H, reference_self, reference_stable=True)
+                    last_control_valid = time.monotonic()
                     metadata.update(reference_timestamp=sample['timestamp'], reference_tcp=tcp, reference_self_prediction=reference_self)
                     save_metadata()
                     print('[contact-line] stable reference latched; model self-prediction:', reference_self, flush=True)
@@ -351,8 +370,6 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                 now, wall = time.monotonic(), time.time()
                 if wall-min(sample['left_stamp'], sample['right_stamp']) > args.contact_line_max_age_ms/1000:
                     controller.pause(now)
-                    if now-last_step > args.contact_line_missing_timeout_s and np.isfinite(last_step):
-                        raise api.SafetyStop('inference latency exceeds sample age budget')
                     continue
                 if not np.isfinite(raw_prediction).all() or np.any(np.abs(raw_prediction) >= .9*target_limit):
                     raise api.SafetyStop('prediction nonfinite or near checkpoint output limit')
@@ -363,15 +380,22 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                 if count % args.contact_line_factor_graph_every == 0:
                     worker.submit()
                 estimate = worker.latest()
-                source_stamp = estimate.get('source_timestamp')
-                if source_stamp is not None:
-                    estimate['timestamp'] = now - (wall-source_stamp)
                 # Use current measured TCP for command generation, synchronized TCP only for geometry.
                 actual = np.asarray(robot.get_tcp_pose(), dtype=float)
+                now, wall = time.monotonic(), time.time()
+                if wall-min(sample['left_stamp'], sample['right_stamp']) > args.contact_line_max_age_ms/1000:
+                    controller.pause(now)
+                    continue
+                source_stamp = estimate.get('source_timestamp')
+                if source_stamp is not None:
+                    # A fixed mapping preserves equality of cached timestamps. Recomputing
+                    # now-wall each poll would fake estimator progress through clock jitter.
+                    estimate['timestamp'] = source_stamp - wall_offset
                 result = controller.step(now, actual, raw_prediction, estimate)
                 if np.any(np.abs(result['desired_deformation']) >= .9*target_limit):
                     raise api.SafetyStop('desired deformation exceeds checkpoint output range')
                 last_step = now
+                last_control_valid = now
                 row = dict(time_s=now-started, timestamp=sample['timestamp'],
                            phase=result['stage'], status=result['status'], reason=result['reason'], dt=result['dt'],
                            reference_id=1, external_contact_evidence=evidence, contact_evidence_source=evidence_kind,

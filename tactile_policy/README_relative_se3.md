@@ -50,7 +50,9 @@ python tactile_policy/train_relative_se3.py --backbone vit --patience 20
 ```bash
 python tactile_policy/infer_tactile_servo_nutbolt_contact_line.py \
   --mode contact-line-probe \
-  --checkpoint tactile_policy/outputs/relative_se3_200_217_resnet/best_model.pt
+  --checkpoint tactile_policy/outputs/relative_se3_200_217_resnet/best_model.pt \
+  --no-contact-line-auto-prepare \
+  --contact-line-contact-established
 
 python tactile_policy/compare_relative_se3.py \
   --dataset-root "/media/zhou/Elements SE/YBZHOU/nut_relative_ou_217" \

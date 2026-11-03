@@ -3087,6 +3087,10 @@ def run_pose_validation(args, robot, tactile, force_reader, model, norm, device)
 
 def main() -> None:
     args = parse_args()
+    if args.mode == "contact-line-probe" and args.contact_line_strategy == "feedback":
+        print("[contact-line] resolved plane point (reference TCP, mm):",
+              args.contact_line_plane_point_mm, "normal:", args.contact_line_plane_normal,
+              "source:", args.contact_line_plane_point_source, flush=True)
     device = resolve_device(args.device)
     model, norm = load_model(args.checkpoint, device)
     if (args.mode == "contact-line-probe" and args.contact_line_strategy == "feedback"
