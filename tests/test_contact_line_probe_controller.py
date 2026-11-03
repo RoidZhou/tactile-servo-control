@@ -182,6 +182,12 @@ class ProbeControllerTests(unittest.TestCase):
             if out['finished']: break
         self.assertTrue(out['finished'])
         self.assertEqual(out['reason'], 'motion_travel_limit')
+        self.assertGreater(np.linalg.norm(out['candidate_command'][3:]), 0.)
+        np.testing.assert_allclose(out['command'], 0.)
+        limits = out['travel_diagnostics']
+        self.assertLess(limits['rotation_margin_deg'], 0.)
+        self.assertGreaterEqual(limits['translation_margin_mm'], 0.)
+        self.assertGreaterEqual(limits['normal_margin_mm'], 0.)
 
     def test_release_timeout_does_not_chase_forever(self):
         c = ProbeController(config(angle_x_rad=0, angle_y_rad=0), np.zeros(6), np.zeros(6))

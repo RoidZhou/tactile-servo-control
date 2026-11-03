@@ -357,6 +357,11 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
               'contact_acquire_n', 'contact_release_n', 'contact_low_s', 'contact_low_samples']
     for prefix in ('tcp', 'control_tcp', 'pred', 'raw_pred', 'desired', 'measured_feedback', 'desired_feedback', 'error', 'command'):
         fields += [prefix + '_' + axis for axis in ('x', 'y', 'z', 'rx', 'ry', 'rz')]
+    fields += ['candidate_tcp_' + axis for axis in ('x', 'y', 'z', 'rx', 'ry', 'rz')]
+    fields += ['travel_' + name for name in (
+        'translation_mm', 'translation_limit_mm', 'translation_margin_mm',
+        'normal_signed_mm', 'normal_abs_mm', 'normal_limit_mm', 'normal_margin_mm',
+        'rotation_deg', 'rotation_limit_deg', 'rotation_margin_deg')]
     fields += ['line_' + name + '_' + axis for name in ('point', 'direction') for axis in ('x', 'y', 'z')]
     started = time.monotonic()
     wall_offset = time.time() - started
@@ -514,15 +519,27 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                 for prefix, values in (('tcp', tcp), ('control_tcp', actual), ('pred', prediction), ('raw_pred', raw_prediction),
                                        ('desired', result['desired_deformation']), ('error', result['error']),
                                        ('measured_feedback', result['measured_feedback_deformation']),
-                                       ('desired_feedback', result['desired_feedback_deformation']), ('command', result['command'])):
+                                       ('desired_feedback', result['desired_feedback_deformation']), ('command', result['command']),
+                                       ('candidate_tcp', result['candidate_command'])):
                     row.update({prefix+'_'+axis: value for axis, value in zip(('x', 'y', 'z', 'rx', 'ry', 'rz'), values)})
+                if result['travel_diagnostics'] is not None:
+                    row.update({'travel_'+name: value for name, value in result['travel_diagnostics'].items()})
                 if estimate.get('valid'):
                     for name, key in (('point', 'center_base'), ('direction', 'direction_base')):
                         row.update({'line_'+name+'_'+axis: value for axis, value in zip(('x', 'y', 'z'), estimate[key])})
                 writer.writerow(row)
                 handle.flush()
                 if result['status'] == 'failed':
-                    raise api.SafetyStop('feedback controller: ' + result['reason'])
+                    detail = 'feedback controller: ' + result['reason']
+                    limits = result.get('travel_diagnostics')
+                    if limits is not None:
+                        detail += ' (candidate travel: translation={:.3f}/{:.3f} mm, normal={:.3f}/{:.3f} mm, rotation={:.3f}/{:.3f} deg; margins={:.3f}/{:.3f}/{:.3f})'.format(
+                            limits['translation_mm'], limits['translation_limit_mm'],
+                            limits['normal_abs_mm'], limits['normal_limit_mm'],
+                            limits['rotation_deg'], limits['rotation_limit_deg'],
+                            limits['translation_margin_mm'], limits['normal_margin_mm'],
+                            limits['rotation_margin_deg'])
+                    raise api.SafetyStop(detail)
                 api.command_pose(robot, result['command'], args.execute)
                 if now-last_print >= 1.:
                     print('[contact-line] phase={} line={} ({}) age={} stable={:.2f}s'.format(
