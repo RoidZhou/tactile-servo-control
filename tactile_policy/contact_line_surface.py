@@ -18,7 +18,7 @@ import time
 
 import numpy as np
 from scipy.optimize import least_squares
-from scipy.sparse import lil_matrix
+from scipy.sparse import coo_matrix
 
 
 class _SolveDeadline(RuntimeError):
@@ -182,7 +182,7 @@ class SurfaceContactLineEstimator:
         sd = np.sin(np.deg2rad(self.plane_direction_sigma_deg))
         tp = self.temporal_position_sigma_mm / 1000
         td = np.sin(np.deg2rad(self.temporal_direction_sigma_deg))
-        started = time.monotonic()
+        started = time.perf_counter()
 
         def unpack(x):
             state = x.reshape(n, 6)
@@ -191,7 +191,7 @@ class SurfaceContactLineEstimator:
             return state[:, :3], dirs, lengths
 
         def residual(x):
-            if time.monotonic() - started > self.max_solve_seconds:
+            if time.perf_counter() - started > self.max_solve_seconds:
                 raise _SolveDeadline()
             centers, dirs, lengths = unpack(x)
             geometry = np.c_[np.einsum('ij,ij->i', normals, centers - points_relative) / sp,
@@ -203,24 +203,59 @@ class SurfaceContactLineEstimator:
             temporal = np.c_[transverse / tp, np.cross(dirs[:-1], dirs[1:]) / td]
             return np.r_[geometry.ravel(), temporal.ravel()]
 
-        sparsity = lil_matrix((4*n + 6*(n-1), 6*n), dtype=int)
-        for index in range(n):
-            sparsity[4*index:4*index+4, 6*index:6*index+6] = 1
-        for index in range(n-1):
-            row = 4*n + 6*index
-            sparsity[row:row+6, 6*index:6*index+12] = 1
+        # Analytic block Jacobian avoids graph-coloured finite differences on
+        # every solve. This retains the same residuals, robust loss and gates.
+        geometry_rows = np.broadcast_to(4*np.arange(n)[:, None, None] + np.arange(4)[None, :, None], (n, 4, 6))
+        geometry_cols = np.broadcast_to(6*np.arange(n)[:, None, None] + np.arange(6)[None, None, :], (n, 4, 6))
+        temporal_rows = np.broadcast_to(4*n + 6*np.arange(n-1)[:, None, None] + np.arange(6)[None, :, None], (n-1, 6, 12))
+        temporal_cols = np.broadcast_to(6*np.arange(n-1)[:, None, None] + np.arange(12)[None, None, :], (n-1, 6, 12))
+        rows = np.r_[geometry_rows.ravel(), temporal_rows.ravel()]
+        cols = np.r_[geometry_cols.ravel(), temporal_cols.ravel()]
+
+        def cross_matrices(vectors):
+            matrices = np.zeros((len(vectors), 3, 3))
+            matrices[:, 0, 1], matrices[:, 0, 2] = -vectors[:, 2], vectors[:, 1]
+            matrices[:, 1, 0], matrices[:, 1, 2] = vectors[:, 2], -vectors[:, 0]
+            matrices[:, 2, 0], matrices[:, 2, 1] = -vectors[:, 1], vectors[:, 0]
+            return matrices
+
+        def jacobian(x):
+            if time.perf_counter() - started > self.max_solve_seconds:
+                raise _SolveDeadline()
+            centers, dirs, lengths = unpack(x)
+            derivative = (np.eye(3)[None] - dirs[:, :, None]*dirs[:, None, :]) / np.maximum(lengths[:, None, None], 1e-12)
+            geometry = np.zeros((n, 4, 6))
+            geometry[:, 0, :3] = normals / sp
+            geometry[:, 1, 3:] = np.einsum('ni,nij->nj', normals, derivative) / sd
+            geometry[:, 2, 3:] = dirs / .01
+            geometry[:, 3, :3] = dirs / sp
+            geometry[:, 3, 3:] = np.einsum('ni,nij->nj', centers, derivative) / sp
+            delta = centers[1:] - centers[:-1]
+            d0, d1 = dirs[:-1], dirs[1:]
+            projection = np.eye(3)[None] - d0[:, :, None]*d0[:, None, :]
+            temporal = np.zeros((n-1, 6, 12))
+            temporal[:, :3, :3] = -projection / tp
+            temporal[:, :3, 6:9] = projection / tp
+            along = np.einsum('ni,ni->n', delta, d0)
+            temporal[:, :3, 3:6] = -((d0[:, :, None]*delta[:, None, :]
+                + along[:, None, None]*np.eye(3)[None]) @ derivative[:-1]) / tp
+            temporal[:, 3:, 3:6] = -cross_matrices(d1) @ derivative[:-1] / td
+            temporal[:, 3:, 9:12] = cross_matrices(d0) @ derivative[1:] / td
+            values = np.r_[geometry.ravel(), temporal.ravel()]
+            return coo_matrix((values, (rows, cols)), shape=(4*n + 6*(n-1), 6*n)).tocsr()
         try:
-            fit = least_squares(residual, seed.ravel(), jac_sparsity=sparsity.tocsr(),
+            fit = least_squares(residual, seed.ravel(), jac=jacobian,
                                 loss='soft_l1', x_scale='jac', max_nfev=self.max_nfev,
+                                tr_options={'maxiter': 40, 'atol': 1e-4, 'btol': 1e-4},
                                 ftol=1e-5, xtol=1e-5, gtol=1e-5)
         except _SolveDeadline:
-            result['optimizer_seconds'] = time.monotonic() - started
+            result['optimizer_seconds'] = time.perf_counter() - started
             return invalid('optimizer_time_budget')
         except (ValueError, np.linalg.LinAlgError):
-            result['optimizer_seconds'] = time.monotonic() - started
+            result['optimizer_seconds'] = time.perf_counter() - started
             return invalid('optimizer_numerical_failure')
         result.update(optimizer_success=bool(fit.success), optimizer_updated=True,
-                      optimizer_seconds=time.monotonic() - started,
+                      optimizer_seconds=time.perf_counter() - started,
                       optimizer_cost=float(fit.cost), optimizer_nfev=int(fit.nfev))
         if result['optimizer_seconds'] > self.max_solve_seconds:
             return invalid('optimizer_time_budget')

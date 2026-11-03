@@ -174,6 +174,23 @@ class SurfaceContactTests(unittest.TestCase):
         self.assertFalse(result['valid'])
         self.assertEqual(result['reason'], 'optimizer_time_budget')
 
+    def test_analytic_jacobian_matches_central_differences(self):
+        estimator = self.estimator(max_solve_seconds=5.)
+        self.append_plane_sequence(estimator)
+        def verify(residual, initial, jac, **kwargs):
+            value = initial + np.random.RandomState(7).normal(0., .0001, len(initial))
+            actual = jac(value).toarray()
+            numeric = np.empty_like(actual)
+            for column in range(len(value)):
+                step = np.zeros_like(value)
+                step[column] = 1e-7
+                numeric[:, column] = (residual(value+step)-residual(value-step))/(2e-7)
+            np.testing.assert_allclose(actual, numeric, rtol=1e-5, atol=1e-5)
+            return SimpleNamespace(success=True, x=initial, cost=0., nfev=1)
+        with mock.patch('tactile_policy.contact_line_surface.least_squares', side_effect=verify):
+            result = estimator.estimate()
+        self.assertTrue(result['valid'], result['reason'])
+
     def test_final_solver_operation_cannot_exceed_time_budget(self):
         estimator = self.estimator(max_solve_seconds=.1)
         self.append_plane_sequence(estimator)
@@ -181,7 +198,7 @@ class SurfaceContactTests(unittest.TestCase):
             return SimpleNamespace(success=True, x=initial, cost=0., nfev=1)
         with mock.patch('tactile_policy.contact_line_surface.least_squares',
                         side_effect=delayed_result), mock.patch(
-                            'tactile_policy.contact_line_surface.time.monotonic',
+                            'tactile_policy.contact_line_surface.time.perf_counter',
                             side_effect=[10., 10.2]):
             result = estimator.estimate()
         self.assertFalse(result['valid'])

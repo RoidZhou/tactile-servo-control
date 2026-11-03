@@ -96,6 +96,46 @@ class RuntimeTests(unittest.TestCase):
         np.testing.assert_allclose(H[:3, 2], [1., 0., 0.])
         self.assertAlmostEqual(np.linalg.det(H[:3, :3]), 1.)
 
+    def test_contact_hysteresis_retains_near_threshold_but_pauses_weak_evidence(self):
+        gate = runtime.ContactEvidenceGate([5., 4.])
+        self.assertFalse(gate.update(1., [5.4, 4.])['valid'])
+        self.assertTrue(gate.update(1.1, [5.6, 4.])['valid'])
+        self.assertTrue(gate.update(1.2, [5.35, 4.])['valid'])
+        low = gate.update(1.3, [5.1, 4.1])
+        self.assertFalse(low['valid'])
+        self.assertFalse(low['lost'])
+        self.assertTrue(gate.update(1.4, [5.3, 4.])['valid'])
+        self.assertFalse(gate.update(1.5, [5.1, 4.])['lost'])
+
+    def test_contact_loss_requires_consecutive_fresh_samples_not_unsynchronized_gaps(self):
+        gate = runtime.ContactEvidenceGate([5., 4.])
+        gate.update(1., [5.6, 4.])
+        gate.update(1.1, [5.1, 4.])
+        gap = gate.update(1.6, [5.1, 4.])
+        self.assertFalse(gap['lost'])
+        self.assertEqual(gap['low_samples'], 1)
+        for stamp in [1.7, 1.8, 1.91]:
+            low = gate.update(stamp, [5.1, 4.])
+        self.assertTrue(low['lost'])
+        self.assertGreaterEqual(low['low_samples'], 3)
+        with self.assertRaises(ValueError):
+            gate.update(1.91, [5.1, 4.])
+
+    def test_simulated_real_contact_loss_is_logged_with_rejected_frames_and_stops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            outcome, commands, metadata = self.simulate(directory, lose_contact=True)
+            self.assertIn('external-contact force-change evidence lost:', outcome)
+            self.assertIn('delta_N=', outcome)
+            self.assertGreater(len(commands), 0)
+            self.assertEqual(metadata['last_contact_evidence']['state'], 'evidence_lost')
+            import csv
+            with (Path(directory)/'probe.csv').open(encoding='utf-8') as handle:
+                rows = list(csv.DictReader(handle))
+            rejected = [row for row in rows if row['event'] == 'contact_evidence']
+            self.assertGreaterEqual(len(rejected), 3)
+            self.assertEqual(rows[-1]['event'], 'contact_evidence_lost')
+            self.assertEqual(rows[-1]['motion_command_sent'], 'False')
+
     def test_worker_invalid_results_replace_previous_valid_line(self):
         completed = threading.Event()
         estimator = SimpleNamespace(estimate=mock.Mock(side_effect=[
@@ -129,12 +169,15 @@ class RuntimeTests(unittest.TestCase):
             worker.close()
         self.assertFalse(worker.thread.is_alive())
 
-    def simulate(self, directory, inference_delay=0., missing=False):
+    def simulate(self, directory, inference_delay=0., missing=False, lose_contact=False):
         args = parse_entry_args(MANUAL + ['--contact-line-no-follow', '--contact-line-reference-stable-s', '.1',
             '--contact-line-reference-timeout-s', '2', '--contact-line-ramp-s', '.1',
             '--contact-line-rock-period-s', '.4', '--contact-line-release-s', '.1',
             '--contact-line-release-timeout-s', '2', '--contact-line-output', str(Path(directory)/'probe.csv')])
         clock = SimpleNamespace(now=0.)
+        if lose_contact:
+            args.contact_line_contact_established = False
+            args.contact_line_free_grasp_forces_n = [2., 2.]
         robot = SimpleNamespace(pose=np.zeros(6))
         robot.get_tcp_pose = lambda: robot.pose.copy()
         class Source:
@@ -147,7 +190,8 @@ class RuntimeTests(unittest.TestCase):
                     return None
                 self.accepted_count += 1
                 stamp = 1000.+clock.now
-                frame = dict(force6d=np.array([3., 0., 0., 0., 0., 0.]), prediction=robot.pose.copy())
+                force = 2.1 if lose_contact and clock.now > .5 else 3.
+                frame = dict(force6d=np.array([force, 0., 0., 0., 0., 0.]), prediction=robot.pose.copy())
                 return dict(left=frame, right=frame, tcp=robot.pose.copy(), timestamp=stamp,
                             left_stamp=stamp, right_stamp=stamp, left_right_delta_ms=0.,
                             tcp_skew_ms=0., tcp_span_ms=0., sample_age_s=0.)

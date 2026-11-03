@@ -43,4 +43,10 @@ python tactile_policy/infer_tactile_servo_nutbolt_contact_line.py \
 
 默认写入 `tactile_policy/logs/contact_line_probe.csv` 与同名 `.metadata.json`，记录同步时间差、形变目标与误差、当前/指令 TCP、接触依据、线有效性和退化原因。`--contact-line-no-follow` 可只采集反馈 rocking；`--contact-line-strategy waypoints --contact-line-estimator svd` 可使用旧航点探测用于对比。
 
+力变化接触判断采用迟滞：`--contact-line-contact-change-n` 默认 0.5 N，用于建立接触依据；`--contact-line-contact-release-n` 默认 0.25 N，用于建立后的维持判断，必须小于前者。弱依据期间立即暂停命令；至少 3 个连续新帧且捕获时间跨度达到 `--contact-line-contact-loss-s`（默认 0.3 秒）才报丢失。超过 0.2 秒的采样间隔会重新开始连续低值计数，缺帧仍由原有同步/反馈超时检查处理。该迟滞减少阈值附近的反复切换，不代表能独立证明螺母没有脱离螺栓。
+
+CSV 的 `event=control` 表示一次控制记录；`waiting_for_sync`、`contact_evidence` 和 `contact_evidence_lost` 记录暂停或停止。这些事件行可能没有模型输出，分析时应按 `event` 筛选；`motion_command_sent` 表示该记录是否将发送运动命令。`contact_strength_n` 是双侧力变化绝对值的最大值，`contact_low_s` 与 `contact_low_samples` 记录连续弱依据时间和帧数。异常信息和 metadata 同时保存停止时的双侧力、自由夹持基准和力变化。
+
+表面优化使用解析稀疏 Jacobian，并限制内部线性迭代；原有 0.2 秒求解预算、收敛检查、几何可观测性和残差门限继续生效。求解加速不会把几何退化的窗口改判为有效。
+
 新增控制、同步与表面估计已通过离线单元测试；实际机器人行为和接触线精度仍需实机验证。
