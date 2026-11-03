@@ -75,8 +75,9 @@ CALIBRATED_TCP_POSE_BASE = np.asarray(
 )
 DEFAULT_CHECKPOINT = (
     PROJECT_ROOT
-    / "/home/lhy/ur5-tactile-servo/tactile_policy/outputs/tactile_pose_merged_16153_simple_cnn/best_model.pt"
+    / "/home/mel/ybzhou/tactile-servo-control/tactile_policy/output/relative_se3_200_217/best_model.pt"
 )
+PREPARATION_CHECKPOINT= "/home/mel/ybzhou/tactile-servo-control/tactile_policy/output/tactile_pose_merged_16153_simple_cnn/best_model.pt"
 
 # 仅 fixed-cycle 使用此抓取点；不改动其他模式原有的标定参考。
 FIXED_CYCLE_GRASP_TCP_POSE = np.asarray(
@@ -116,7 +117,7 @@ def three_floats(value: str) -> np.ndarray:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
-    parser.add_argument("--preparation-checkpoint", type=Path, default=None,
+    parser.add_argument("--preparation-checkpoint", type=Path, default=PREPARATION_CHECKPOINT,
                         help="Absolute-offset model for automatic grasp/transport/descent when probing with a paired SE3 model.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--host", default="127.0.0.1")
