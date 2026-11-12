@@ -69,7 +69,7 @@ class ProbeConfig:
     settle_s: float = 1.
     ramp_s: float = 3.
     rock_period_s: float = 20.
-    rock_cycles: int = 2
+    rock_cycles: float = 1.25
     back_forth_period_s: float = 8.
     back_forth_cycles: int = 2
     back_forth_x_m: float = .0003
@@ -125,7 +125,9 @@ class ProbeConfig:
                 continue
             if value < 0 or (value == 0 and item.name not in nonnegative):
                 raise ValueError(item.name + ' must be positive')
-        for name in ('rock_cycles', 'back_forth_cycles', 'min_line_samples'):
+        if self.rock_cycles <= 0:
+            raise ValueError('rock_cycles must be positive')
+        for name in ('back_forth_cycles', 'min_line_samples'):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(name + ' must be an integer')

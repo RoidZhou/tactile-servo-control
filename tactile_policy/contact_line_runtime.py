@@ -40,9 +40,10 @@ def add_probe_arguments(parser):
         'poll-hz': 100., 'tcp-skew-ms': 40., 'max-age-ms': 150., 'missing-timeout-s': 1.,
         'reference-stable-s': 1., 'reference-timeout-s': 15.,
         'reference-position-mm': .1, 'reference-angle-deg': .1, 'reference-force-n': .2,
-        'contact-change-n': .5, 'contact-loss-s': .3,
-        'ramp-s': 3., 'rock-period-s': 20., 'deformation-roll-deg': .3,
-        'deformation-pitch-deg': .2, 'normal-deformation-mm': 0.,
+        'contact-change-n': .5, 'contact-release-n': .25, 'contact-loss-s': .3,
+        'ramp-s': 5., 'rock-period-s': 20., 'rock-cycles': 1.25,
+        'deformation-roll-deg': 1., 'deformation-pitch-deg': .6,
+        'normal-deformation-mm': 0.,
         'back-forth-period-s': 8., 'back-forth-cycles': 2,
         'back-forth-x-mm': .3, 'back-forth-y-mm': .3,
         'follow-s': 20., 'release-s': 3., 'release-timeout-s': 8.,
@@ -61,6 +62,16 @@ def add_probe_arguments(parser):
 
 
 def validate_probe_arguments(parser, args):
+    # The focused entry point historically called this option probe-cycles,
+    # while the shared/original-paper entry point calls it rock-cycles.  Keep
+    # both entry points usable after merges, but expose one canonical value to
+    # the controller.
+    if not hasattr(args, 'contact_line_rock_cycles'):
+        if not hasattr(args, 'contact_line_probe_cycles'):
+            parser.error('missing contact-line rocking cycle count')
+        args.contact_line_rock_cycles = args.contact_line_probe_cycles
+    if not hasattr(args, 'contact_line_contact_release_n'):
+        args.contact_line_contact_release_n = .25
     if args.contact_line_estimator is None:
         args.contact_line_estimator = 'surface' if args.contact_line_strategy == 'feedback' else 'svd'
     if args.mode != 'contact-line-probe':
@@ -119,11 +130,18 @@ def validate_probe_arguments(parser, args):
 
 
 def make_controller_config(a):
+    rock_cycles = getattr(a, 'contact_line_rock_cycles',
+                          getattr(a, 'contact_line_probe_cycles', None))
+    if rock_cycles is None:
+        raise ValueError('missing rocking cycle count')
+    back_forth_cycles = float(a.contact_line_back_forth_cycles)
+    if not back_forth_cycles.is_integer():
+        raise ValueError('back_forth_cycles must be an integer')
     return ProbeConfig(
         settle_s=a.contact_line_reference_stable_s, ramp_s=a.contact_line_ramp_s,
-        rock_period_s=a.contact_line_rock_period_s, rock_cycles=a.contact_line_probe_cycles,
+        rock_period_s=a.contact_line_rock_period_s, rock_cycles=float(rock_cycles),
         back_forth_period_s=a.contact_line_back_forth_period_s,
-        back_forth_cycles=a.contact_line_back_forth_cycles,
+        back_forth_cycles=int(back_forth_cycles),
         back_forth_x_m=a.contact_line_back_forth_x_mm / 1000,
         back_forth_y_m=a.contact_line_back_forth_y_mm / 1000,
         follow_s=a.contact_line_follow_s, release_s=a.contact_line_release_s,
@@ -316,6 +334,14 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
     """Execute only through the entry point's existing --execute gate."""
     if getattr(model, 'tactile_input_kind', '') not in ('paired_force', 'paired_depth'):
         raise ValueError('feedback probing requires a paired relative SE3 checkpoint')
+    paired_input = getattr(api, 'paired_tactile_input', None)
+    if paired_input is None:
+        # Compatibility with the force-only API used before depth input was
+        # added.  Both callbacks return one preprocessed bilateral frame.
+        force_input = getattr(api, 'paired_force_input', None)
+        if force_input is None:
+            raise ValueError('runtime API lacks paired tactile input preprocessing')
+        paired_input = lambda _model, left, right: force_input(left, right)
     baseline = args.contact_line_free_grasp_forces_n
     preparation = {}
     if args.contact_line_auto_prepare:
@@ -377,7 +403,8 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
     sample = contact = forces = None
     count = 0
     worker = LatestEstimateWorker(estimator)
-    print('[contact-line] feedback: stable reference -> ramp -> rocking -> qualified line follow -> release', flush=True)
+    print('[contact-line] feedback: stable reference -> push-down -> rocking -> '
+          'back-and-forth-x/y -> qualified line follow -> release', flush=True)
     print('[contact-line] bottom plane (mm), normal:', args.contact_line_plane_point_mm, args.contact_line_plane_normal, flush=True)
     print('[contact-line] plane source:', args.contact_line_plane_point_source, flush=True)
     print('[contact-line] CSV:', output, '; metadata:', meta_path, flush=True)
@@ -465,7 +492,7 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                 if controller is None:
                     if not stable.update(sample['timestamp'], tcp, forces):
                         continue
-                    reference = api.paired_tactile_input(model, left, right)
+                    reference = paired_input(model, left, right)
                     reference_self = api.predict_pair_motion(model, norm, reference, reference, device)
                     if not np.isfinite(reference_self).all() or np.any(np.abs(reference_self) >= .25*target_limit):
                         raise api.SafetyStop('reference self-prediction too large; check model/preprocessing')
@@ -479,7 +506,7 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                     continue
                 raw_prediction = api.predict_pair_motion(
                     model, norm, reference,
-                    api.paired_tactile_input(model, left, right), device,
+                    paired_input(model, left, right), device,
                 )
                 now, wall = time.monotonic(), time.time()
                 if wall-min(sample['left_stamp'], sample['right_stamp']) > args.contact_line_max_age_ms/1000:
