@@ -285,7 +285,8 @@ class ProbeController:
         self.desired_feedback = desired
         return desired
 
-    def _result(self, actual, desired, measured, error, dt, increment=None):
+    def _result(self, actual, desired, measured, error, dt, increment=None,
+                candidate_command=None, travel_diagnostics=None):
         return dict(command=_pose(actual), stage=self.stage, status=self.status,
                     reason=self.reason, finished=self.finished, dt=float(dt),
                     release_reason=self.release_reason,
@@ -297,15 +298,20 @@ class ProbeController:
                     line_reset_reason=self.line_reset_reason, velocity=self.velocity.copy(),
                     tcp_velocity_world=self.tcp_velocity.copy(),
                     command_increment=np.zeros(6) if increment is None else increment.copy(),
+                    candidate_command=_pose(actual if candidate_command is None else candidate_command),
+                    travel_diagnostics=travel_diagnostics,
                     angular_path_rad=self.angle_path_rad, translation_path_m=self.translation_path_m)
 
-    def _fail(self, actual, reason, desired, measured, error, dt):
+    def _fail(self, actual, reason, desired, measured, error, dt,
+              candidate_command=None, travel_diagnostics=None):
         self.finished = True
         self.status = 'failed'
         self.reason = reason
         self.velocity[:] = 0
         self.tcp_velocity[:] = 0
-        return self._result(actual, desired, measured, error, dt)
+        return self._result(actual, desired, measured, error, dt,
+                            candidate_command=candidate_command,
+                            travel_diagnostics=travel_diagnostics)
 
     def step(self, t_monotonic, tcp, prediction, line_estimate=None):
         c = self.config
@@ -437,12 +443,29 @@ class ProbeController:
         command[:3, :3] = _matrix(Rotation.from_rotvec(self.tcp_velocity[3:] * dt)) @ actual[:3, :3]
         travel = _pose(_inverse(self.initial) @ command)
         normal_travel = (world_R.T @ ((command @ self.H)[:3, 3] - self.initial_feedback[:3, 3]))[2]
-        if (np.linalg.norm(travel[:3]) > c.max_total_translation_m
-                or abs(normal_travel) > c.max_normal_translation_m
-                or np.linalg.norm(travel[3:]) > c.max_total_rotation_rad):
-            return self._fail(actual, 'motion_travel_limit', desired, measured, error, dt)
+        translation_m = np.linalg.norm(travel[:3])
+        normal_m = abs(normal_travel)
+        rotation_rad = np.linalg.norm(travel[3:])
+        travel_diagnostics = {
+            'translation_mm': float(translation_m * 1000.),
+            'translation_limit_mm': float(c.max_total_translation_m * 1000.),
+            'translation_margin_mm': float((c.max_total_translation_m - translation_m) * 1000.),
+            'normal_signed_mm': float(normal_travel * 1000.),
+            'normal_abs_mm': float(normal_m * 1000.),
+            'normal_limit_mm': float(c.max_normal_translation_m * 1000.),
+            'normal_margin_mm': float((c.max_normal_translation_m - normal_m) * 1000.),
+            'rotation_deg': float(np.rad2deg(rotation_rad)),
+            'rotation_limit_deg': float(np.rad2deg(c.max_total_rotation_rad)),
+            'rotation_margin_deg': float(np.rad2deg(c.max_total_rotation_rad - rotation_rad)),
+        }
+        if (translation_m > c.max_total_translation_m
+                or normal_m > c.max_normal_translation_m
+                or rotation_rad > c.max_total_rotation_rad):
+            return self._fail(actual, 'motion_travel_limit', desired, measured, error, dt,
+                              candidate_command=command, travel_diagnostics=travel_diagnostics)
         step = _pose(_inverse(actual) @ command)
         self.angle_path_rad += np.linalg.norm(step[3:])
         self.translation_path_m += np.linalg.norm(step[:3])
         self.last_command = command.copy()
-        return self._result(command, desired, measured, error, dt, step)
+        return self._result(command, desired, measured, error, dt, step,
+                            candidate_command=command, travel_diagnostics=travel_diagnostics)

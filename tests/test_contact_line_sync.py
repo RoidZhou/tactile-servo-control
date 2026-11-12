@@ -140,6 +140,38 @@ class ProbeSyncTests(unittest.TestCase):
             self.robot.observation = state(1000.02)
             self.assertIsNone(self.source.poll())
 
+    def test_duplicate_native_with_recomputed_wall_time_cannot_trigger_rollback(self):
+        self.robot.observation = state(1000.0)
+        self.source.poll()
+        original = self.source.states[-1][1].copy()
+        for jitter in (-.000001, .000001, -.000000238):
+            duplicate = state(1000.0+jitter, np.ones(6))
+            duplicate['rtde_timestamp'] = 100.0
+            self.robot.observation = duplicate
+            self.assertIsNone(self.source.poll())
+            self.assertFalse(self.source.clock_fault)
+            self.assertEqual(len(self.source.states), 1)
+            self.assertEqual(self.source.states[-1][0], 1000.0)
+            np.testing.assert_array_equal(self.source.states[-1][1], original)
+            self.assertEqual(self.source.cursors, [None, None])
+        self.robot.observation = state(1000.02)
+        sample = self.source.poll()
+        self.assertIsNotNone(sample)
+        self.assertFalse(self.source.clock_fault)
+
+    def test_native_progress_with_reversed_mapped_time_is_still_a_clock_fault(self):
+        self.robot.observation = state(1000.0)
+        self.source.poll()
+        observation = state(999.999999)
+        observation['rtde_timestamp'] = 100.008
+        self.robot.observation = observation
+        self.assertIsNone(self.source.poll())
+        self.assertTrue(self.source.clock_fault)
+        self.assertIn('mapped RTDE clock moved backwards', self.source.last_reason)
+        self.assertIn('native 100.0 -> 100.008', self.source.last_reason)
+        self.assertEqual(len(self.source.states), 0)
+        self.assertEqual(self.source.cursors, [None, None])
+
     def test_tactile_clock_rollback_and_host_clock_rollback(self):
         self.prime()
         self.tactile.left.frames = [frame(1000.005)]

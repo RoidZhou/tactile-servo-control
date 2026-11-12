@@ -64,6 +64,20 @@ class ProbeControllerTests(unittest.TestCase):
             return actual
         np.testing.assert_allclose(simulate(.1), simulate(.05), atol=1e-10)
 
+    def test_original_rocking_profile_ramps_then_rocks_for_fractional_cycles(self):
+        cfg = config(ramp_s=5., rock_period_s=20., rock_cycles=1.25,
+                     angle_x_rad=np.deg2rad(1.), angle_y_rad=np.deg2rad(.6))
+        c = ProbeController(cfg, np.zeros(6), np.zeros(6))
+        c.elapsed = cfg.ramp_s
+        c._transition('rock')
+        np.testing.assert_allclose(c._target()[3:5], [np.deg2rad(1.), 0.], atol=1e-12)
+        c.elapsed = cfg.rock_period_s / 4
+        np.testing.assert_allclose(c._target()[3:5], [0., np.deg2rad(.6)], atol=1e-12)
+        c.elapsed = cfg.rock_period_s / 2
+        np.testing.assert_allclose(c._target()[3:5], [-np.deg2rad(1.), 0.], atol=1e-12)
+        c.elapsed = cfg.rock_period_s * cfg.rock_cycles
+        self.assertGreaterEqual(c.elapsed, 25.)
+
     def test_complete_tcp_speed_acceleration_and_step_bounds_with_pivot(self):
         cfg = config(ramp_s=.1, angle_x_rad=.3, angle_y_rad=.2, rock_period_s=10.,
                      max_total_rotation_rad=.5)
@@ -183,6 +197,12 @@ class ProbeControllerTests(unittest.TestCase):
             if out['finished']: break
         self.assertTrue(out['finished'])
         self.assertEqual(out['reason'], 'motion_travel_limit')
+        self.assertGreater(np.linalg.norm(out['candidate_command'][3:]), 0.)
+        np.testing.assert_allclose(out['command'], 0.)
+        limits = out['travel_diagnostics']
+        self.assertLess(limits['rotation_margin_deg'], 0.)
+        self.assertGreaterEqual(limits['translation_margin_mm'], 0.)
+        self.assertGreaterEqual(limits['normal_margin_mm'], 0.)
 
     def test_release_timeout_does_not_chase_forever(self):
         c = ProbeController(config(angle_x_rad=0, angle_y_rad=0), np.zeros(6), np.zeros(6))
@@ -204,7 +224,8 @@ class ProbeControllerTests(unittest.TestCase):
         with self.assertRaises(ProbeControlError):
             ProbeController(config(), np.zeros(6), np.zeros((4,4)))
         with self.assertRaises(ValueError): ProbeConfig(max_dt_s=0)
-        with self.assertRaises(ValueError): ProbeConfig(rock_cycles=1.5)
+        self.assertEqual(ProbeConfig(rock_cycles=1.25).rock_cycles, 1.25)
+        with self.assertRaises(ValueError): ProbeConfig(rock_cycles=0.)
 
 
 if __name__ == '__main__':
