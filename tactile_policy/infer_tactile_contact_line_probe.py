@@ -465,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--control-hz", type=float, default=20.0)
     parser.add_argument("--min-tactile-peak", type=float, default=1e-4)
     parser.add_argument(
-        "--tactile-sync-max-skew-ms", type=float, default=20.0,
+        "--tactile-sync-max-skew-ms", type=float, default=60.0,
         help="Maximum left/right SDK capture-time difference.",
     )
     parser.add_argument(
@@ -481,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
               "above the target, and descend until tactile contact change."),
     )
     preparation.add_argument(
-        "--contact-tcp-pose", type=six_floats, default=None,
+        "--contact-tcp-pose", type=six_floats, default=six_floats("-0.43727224,-0.16484881, 0.20620829, -2.18654589, -2.12657183, 0.05866673"),
         help=("TCP [x,y,z,rx,ry,rz] for nominal first nut/bolt contact. "
               "Required when --prepare-probe is enabled."),
     )
@@ -494,7 +494,12 @@ def build_parser() -> argparse.ArgumentParser:
     preparation.add_argument("--move-duration-s", type=float, default=5.0)
     preparation.add_argument("--descent-speed-mm-s", type=float, default=1.0)
     preparation.add_argument("--descent-contact-window-mm", type=float, default=10.0)
-    preparation.add_argument("--descent-contact-change-n", type=float, default=0.5)
+    preparation.add_argument(
+        "--descent-contact-change-n", type=float, default=None,
+        help=("Bilateral force-change threshold during descent. Defaults to "
+              "--contact-line-contact-change-n so preparation and probing "
+              "use the same acquisition threshold."),
+    )
     preparation.add_argument("--descent-contact-frames", type=int, default=3)
     preparation.add_argument("--baseline-samples", type=int, default=10)
     preparation.add_argument("--gripper-force", type=float, default=4.0)
@@ -502,7 +507,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     geometry = parser.add_argument_group("Known contact geometry")
     geometry.add_argument(
-        "--contact-line-plane-point-mm", nargs=3, type=float, required=True,
+        "--contact-line-plane-point-mm", nargs=3, type=float, default=[0.0, 0.0, 100.0],
         help="A calibrated point on the nut bottom plane in reference-TCP axes.",
     )
     geometry.add_argument(
@@ -525,13 +530,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--contact-line-free-grasp-forces-n", nargs=2, type=float,
         help="Left/right force norms measured before external nut/bolt contact.",
     )
-    evidence.add_argument("--contact-line-contact-change-n", type=float, default=0.5)
+    evidence.add_argument(
+        "--contact-line-contact-change-n", type=float, default=0.1,
+        help="Force change required to acquire external contact, in N.",
+    )
+    evidence.add_argument(
+        "--contact-line-contact-release-n", type=float, default=0.05,
+        help=("Force-change hysteresis threshold used to retain contact; "
+              "must be lower than the acquisition threshold."),
+    )
     evidence.add_argument("--contact-line-contact-loss-s", type=float, default=0.3)
 
     reference = parser.add_argument_group("Synchronized stable reference")
-    reference.add_argument("--contact-line-poll-hz", type=float, default=100.0)
-    reference.add_argument("--contact-line-tcp-skew-ms", type=float, default=40.0)
-    reference.add_argument("--contact-line-max-age-ms", type=float, default=150.0)
+    reference.add_argument("--contact-line-poll-hz", type=float, default=20.0)
+    reference.add_argument("--contact-line-tcp-skew-ms", type=float, default=100.0)
+    reference.add_argument("--contact-line-max-age-ms", type=float, default=200.0)
     reference.add_argument("--contact-line-missing-timeout-s", type=float, default=1.0)
     reference.add_argument("--contact-line-reference-stable-s", type=float, default=1.0)
     reference.add_argument("--contact-line-reference-timeout-s", type=float, default=15.0)
@@ -540,11 +553,11 @@ def build_parser() -> argparse.ArgumentParser:
     reference.add_argument("--contact-line-reference-force-n", type=float, default=0.2)
 
     motion = parser.add_argument_group("Paper-style active probing")
-    motion.add_argument("--contact-line-probe-cycles", type=int, default=2)
+    motion.add_argument("--contact-line-probe-cycles", type=int, default=1.25)
     motion.add_argument("--contact-line-ramp-s", type=float, default=3.0)
     motion.add_argument("--contact-line-rock-period-s", type=float, default=20.0)
-    motion.add_argument("--contact-line-deformation-roll-deg", type=float, default=0.3)
-    motion.add_argument("--contact-line-deformation-pitch-deg", type=float, default=0.2)
+    motion.add_argument("--contact-line-deformation-roll-deg", type=float, default=1.0)
+    motion.add_argument("--contact-line-deformation-pitch-deg", type=float, default=0.6)
     motion.add_argument("--contact-line-normal-deformation-mm", type=float, default=0.0)
     motion.add_argument("--contact-line-back-forth-period-s", type=float, default=8.0)
     motion.add_argument("--contact-line-back-forth-cycles", type=int, default=2)
@@ -612,6 +625,12 @@ def parse_args() -> argparse.Namespace:
     args.use_force_safety = False
     args.force_bias = np.zeros(6, dtype=np.float64)
 
+    # Keep one contact-acquisition definition across the preparation descent
+    # and the synchronized active probe.  An explicit descent value remains
+    # available for reproducing an older calibrated run.
+    if args.descent_contact_change_n is None:
+        args.descent_contact_change_n = args.contact_line_contact_change_n
+
     axis_norm = float(np.linalg.norm(args.transport_axis_base))
     if not np.isfinite(axis_norm) or axis_norm < 1e-9:
         parser.error("--transport-axis-base must be finite and nonzero")
@@ -652,7 +671,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--contact-line-window must be at least 6")
     if not 6 <= args.contact_line_min_samples <= args.contact_line_window:
         parser.error("--contact-line-min-samples must be within [6, window]")
-    if args.contact_line_probe_cycles < 1:
+    if args.contact_line_probe_cycles < 0:
         parser.error("--contact-line-probe-cycles must be positive")
     validate_probe_arguments(parser, args)
     return args
@@ -711,6 +730,14 @@ def main() -> None:
         print(
             "  sequence: stable reference -> push-down -> rocking -> "
             "back-and-forth -> line optimization"
+        )
+        print(
+            "  contact thresholds: descent={:.3f}N, acquire={:.3f}N, "
+            "release={:.3f}N".format(
+                args.descent_contact_change_n,
+                args.contact_line_contact_change_n,
+                args.contact_line_contact_release_n,
+            )
         )
 
         if not args.execute:
