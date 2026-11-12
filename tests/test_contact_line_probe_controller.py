@@ -10,6 +10,7 @@ from tactile_policy.contact_line_probe_controller import (
 
 def config(**kwargs):
     defaults = dict(ramp_s=.4, rock_period_s=1., rock_cycles=2, follow_s=.5,
+                    back_forth_period_s=.5, back_forth_cycles=1,
                     release_s=.2, release_timeout_s=.5, line_stable_s=.2,
                     line_max_age_s=.1, max_dt_s=.15)
     defaults.update(kwargs)
@@ -91,7 +92,7 @@ class ProbeControllerTests(unittest.TestCase):
         c = ProbeController(config(), np.zeros(6), np.zeros(6))
         actual = np.zeros(6)
         seen = set()
-        for now in np.arange(0., 4., .05):
+        for now in np.arange(0., 6., .05):
             out = c.step(now, actual, np.zeros(6))
             actual = out['command']; seen.add(out['stage'])
             if out['finished']:
@@ -106,11 +107,11 @@ class ProbeControllerTests(unittest.TestCase):
     def enter_follow(self, **changes):
         c = ProbeController(config(**changes), np.zeros(6), np.zeros(6))
         actual = np.zeros(6)
-        for now in np.arange(0., 2., .05):
+        for now in np.arange(0., 5., .05):
             out = c.step(now, actual, np.zeros(6), line(now))
             actual = out['command']
             if out['stage'] == 'follow':
-                self.assertGreaterEqual(now, 1.4 - 1e-9)
+                self.assertGreaterEqual(now, 3.4 - 1e-9)
                 return c, now, actual, out
         self.fail('stable valid line did not enter follow')
 
@@ -186,7 +187,7 @@ class ProbeControllerTests(unittest.TestCase):
     def test_release_timeout_does_not_chase_forever(self):
         c = ProbeController(config(angle_x_rad=0, angle_y_rad=0), np.zeros(6), np.zeros(6))
         actual = np.zeros(6)
-        for now in np.arange(0., 5., .05):
+        for now in np.arange(0., 7., .05):
             prediction = np.array([.0002,0.,0.,0.,0.,0.])
             out = c.step(now, actual, prediction)
             actual = out['command']

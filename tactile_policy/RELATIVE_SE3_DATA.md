@@ -51,6 +51,12 @@ Train the paired model:
 ```bash
 python tactile_policy/train_relative_se3.py --dataset-root /media/zhou/Elements SE/YBZHOU/nut_relative_ou_no_fts --output-dir tactile_policy/outputs/nut_relative_se3 --pairs-per-episode 10
 ```
+python tactile_policy/train_relative_se3.py \
+  --dataset-root "/media/zhou/Elements SE/YBZHOU/peg_relative_ou_600" \
+  --input-modality depth \
+  --pairs-per-episode 200 \
+  --batch-size 128 \
+  --epochs 300
 
 Training and validation are split by complete episodes. For every selected
 pair, the label is computed from actual robot feedback:
@@ -65,6 +71,6 @@ shared tactile encoder, as in the reference fixed-base FC method. The native
 XENSE `35x20` force grid is not resized.
 
 python real_ur5rg2/merge_lerobot_datasets.py \
-  --source "/media/zhou/Elements SE/YBZHOU/nut_relative_ou" \
-  --source "/media/zhou/Elements SE/YBZHOU/nut_relative_ou_no_fts_test2" \
-  --output "/media/zhou/Elements SE/YBZHOU/nut_relative_ou_217"
+  --source "/media/zhou/Elements SE/YBZHOU/peg_relative_ou_200" \
+  --source "/media/zhou/Elements SE/YBZHOU/peg_relative_ou_400" \
+  --output "/media/zhou/Elements SE/YBZHOU/peg_relative_ou_600"

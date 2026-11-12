@@ -67,6 +67,7 @@ XENSE_FORCE_WIDTH = 20
 TACTILE_FORCE_SAFETY_LIMIT_N = np.asarray([30.0, 25.0, 25.0])
 TACTILE_TORQUE_SAFETY_LIMIT_NMM = np.asarray([100.0, 100.0, 100.0])
 FORCE_TARE_SECONDS = 2.0
+PAIRWISE_INPUT_KINDS = frozenset(("paired_force", "paired_depth"))
 CALIBRATED_TCP_POSE_BASE = np.asarray(
     # [ 0.107776706, -0.696389763,  0.199836926, 0.0, np.pi, 0.0],
     [ -0.027776706, -0.606389763,  0.219836926, 0.0, np.pi, 0.0],
@@ -531,12 +532,20 @@ def resolve_device(value: str) -> torch.device:
     return device
 
 
+def is_pairwise_model(model) -> bool:
+    return getattr(model, "tactile_input_kind", "") in PAIRWISE_INPUT_KINDS
+
+
 def load_model(path: Path, device: torch.device):
     checkpoint = torch.load(
         path.expanduser().resolve(), map_location=device, weights_only=False
     )
     model_type = checkpoint.get("model_type", "simple_cnn")
-    if model_type in ("pairwise_tactile_se3", "pairwise_backbone_se3"):
+    if model_type in (
+        "pairwise_tactile_se3",
+        "pairwise_backbone_se3",
+        "pairwise_native_depth_se3",
+    ):
         from tactile_policy.model import load_pairwise_model
         from tactile_policy.data_relative_se3 import PairNormalization
         model = load_pairwise_model(checkpoint, device)
@@ -544,12 +553,34 @@ def load_model(path: Path, device: torch.device):
             key: np.asarray(checkpoint["normalization"][key], dtype=np.float32)
             for key in ("input_mean", "input_std", "target_limit")
         })
-        if (norm.input_mean.shape != (6,) or norm.input_std.shape != (6,)
+        expected_channels = 2 if model_type == "pairwise_native_depth_se3" else 6
+        if (norm.input_mean.shape != (expected_channels,)
+                or norm.input_std.shape != (expected_channels,)
                 or norm.target_limit.shape != (6,)
                 or not all(np.isfinite(x).all() for x in
                            (norm.input_mean, norm.input_std, norm.target_limit))
                 or np.any(norm.input_std <= 0) or np.any(norm.target_limit <= 0)):
             raise ValueError("Invalid paired-model normalization")
+        if model_type == "pairwise_native_depth_se3":
+            preprocessing = checkpoint.get("input_preprocessing", {})
+            expected_keys = [
+                "observation.tactile_left.depth",
+                "observation.tactile_right.depth",
+            ]
+            input_shape = checkpoint.get("input_shape_per_frame")
+            if (checkpoint.get("input_modality") != "depth"
+                    or checkpoint.get("input_keys") != expected_keys
+                    or preprocessing.get("channel_order_per_time") != ["left", "right"]
+                    or preprocessing.get("time_order") != ["reference", "current"]
+                    or preprocessing.get("png_channel") != 0
+                    or preprocessing.get("resize") is not None
+                    or preprocessing.get("signed_log1p") is not False
+                    or preprocessing.get("per_image_normalization") is not False
+                    or input_shape != [2, *model.input_hw]):
+                raise ValueError(
+                    "Paired depth checkpoint preprocessing/input shape is incompatible"
+                )
+            _validate_live_depth_scale(preprocessing, norm)
         print(f"Loaded paired checkpoint={path.expanduser().resolve()} "
               f"model_type={model_type} config={checkpoint.get('model_config')} "
               f"epoch={checkpoint.get('epoch')} target_limit={norm.target_limit.tolist()}", flush=True)
@@ -990,7 +1021,7 @@ def _live_depth_channel(value, input_hw) -> np.ndarray:
 
 
 def predict_offset(model, norm: Normalization, left: dict, right: dict, device):
-    if getattr(model, "tactile_input_kind", "") == "paired_force":
+    if is_pairwise_model(model):
         raise ValueError("Paired motion requires reference/current tactile; it is not an absolute grasp offset")
     # 预测函数只做推理；拧转循环统一打印同一对控制帧的 Fxyz，避免重复输出。
     # 新增：深度走采集同款灰度转换；原分布力处理完整保留在 else 中。
@@ -1330,11 +1361,32 @@ def prepare_contact_line_probe(args, robot, tactile, force_reader, model, norm, 
     }
 
 
-def paired_force_input(left, right):
-    sides = [np.asarray(frame["force"], dtype=np.float32) for frame in (left, right)]
-    if any(x.ndim != 3 or x.shape[-1] != 3 or not np.isfinite(x).all() for x in sides):
-        raise SafetyStop("Invalid native XENSE force maps")
-    return signed_log1p(np.concatenate(sides, axis=-1).transpose(2, 0, 1)).copy()
+def paired_tactile_input(model, left, right):
+    """Build one bilateral frame using the checkpoint's training modality."""
+    kind = getattr(model, "tactile_input_kind", "")
+    if kind == "paired_force":
+        sides = [
+            np.asarray(frame["force"], dtype=np.float32)
+            for frame in (left, right)
+        ]
+        if any(
+            value.ndim != 3 or value.shape[-1] != 3
+            or not np.isfinite(value).all()
+            for value in sides
+        ):
+            raise SafetyStop("Invalid native XENSE force maps")
+        return signed_log1p(
+            np.concatenate(sides, axis=-1).transpose(2, 0, 1)
+        ).copy()
+    if kind == "paired_depth":
+        return np.stack(
+            [
+                _live_depth_channel(frame.get("depth"), model.input_hw)
+                for frame in (left, right)
+            ],
+            axis=0,
+        ).astype(np.float32)
+    raise ValueError(f"Model is not a supported paired tactile model: {kind!r}")
 
 
 def predict_pair_motion(model, norm, reference, current, device):
@@ -1364,7 +1416,8 @@ def run_contact_line_probe(args, robot, tactile, force_reader, model, norm, devi
     from types import SimpleNamespace
     api = SimpleNamespace(
         load_model=load_model, prepare_contact_line_probe=prepare_contact_line_probe,
-        paired_force_input=paired_force_input, predict_pair_motion=predict_pair_motion,
+        paired_tactile_input=paired_tactile_input,
+        predict_pair_motion=predict_pair_motion,
         inferred_object_frame=inferred_object_frame, format_tactile_frame=format_tactile_frame,
         check_safety=check_safety, command_pose=command_pose, SafetyStop=SafetyStop,
     )
@@ -1379,11 +1432,11 @@ def run_contact_line_waypoint_probe(args, robot, tactile, force_reader, model, n
     """
     if args.contact_line_auto_prepare:
         prepare_model, prepare_norm = model, norm
-        if getattr(model, "tactile_input_kind", "") == "paired_force":
+        if is_pairwise_model(model):
             if args.preparation_checkpoint is None:
                 raise ValueError("Automatic preparation requires --preparation-checkpoint (absolute-offset model); otherwise use --no-contact-line-auto-prepare at established contact")
             prepare_model, prepare_norm = load_model(args.preparation_checkpoint, device)
-            if getattr(prepare_model, "tactile_input_kind", "") == "paired_force":
+            if is_pairwise_model(prepare_model):
                 raise ValueError("Preparation checkpoint must predict absolute offset")
         prepare_contact_line_probe(
             args, robot, tactile, force_reader, prepare_model, prepare_norm, device
@@ -1437,7 +1490,7 @@ def run_contact_line_waypoint_probe(args, robot, tactile, force_reader, model, n
     started = time.monotonic()
     last_stamps = None
     last_sync_print = float("-inf")
-    reference_force = None
+    reference_tactile = None
     period = 1.0 / args.control_hz
     print(f"[contact-line] left/right capture skew limit: {args.tactile_sync_max_skew_ms:g} ms; "
           "unsynchronized pairs are skipped", flush=True)
@@ -1446,7 +1499,7 @@ def run_contact_line_waypoint_probe(args, robot, tactile, force_reader, model, n
         writer, target: np.ndarray, cycle: int, waypoint: int,
         stage: str, progress: float, local_rpy: np.ndarray,
     ) -> dict | None:
-        nonlocal last_stamps, reference_force, last_sync_print
+        nonlocal last_stamps, reference_tactile, last_sync_print
         left, right = tactile.read()
         check_safety(args, force_reader, left, right)
         if min(tactile_peaks(left, right)) < args.min_tactile_peak:
@@ -1466,15 +1519,17 @@ def run_contact_line_waypoint_probe(args, robot, tactile, force_reader, model, n
             return None
         last_stamps = stamps
         actual = np.asarray(robot.get_tcp_pose(), dtype=np.float64)
-        paired = getattr(model, "tactile_input_kind", "") == "paired_force"
+        paired = is_pairwise_model(model)
         if paired:
-            current_force = paired_force_input(left, right)
-            if reference_force is None:
-                reference_force = current_force.copy()
+            current_tactile = paired_tactile_input(model, left, right)
+            if reference_tactile is None:
+                reference_tactile = current_tactile.copy()
                 prediction = np.zeros(6)
                 print("[contact-line] Latched first fresh bilateral reference frame; prediction is local xyz + rotvec (m/rad).", flush=True)
             else:
-                prediction = predict_pair_motion(model, norm, reference_force, current_force, device)
+                prediction = predict_pair_motion(
+                    model, norm, reference_tactile, current_tactile, device
+                )
         else:
             prediction = predict_offset(model, norm, left, right, device).astype(np.float64)
         if actual.shape != (6,) or prediction.shape != (6,) or not (
@@ -3090,9 +3145,9 @@ def main() -> None:
     device = resolve_device(args.device)
     model, norm = load_model(args.checkpoint, device)
     if (args.mode == "contact-line-probe" and args.contact_line_strategy == "feedback"
-            and getattr(model, "tactile_input_kind", "") != "paired_force"):
+            and not is_pairwise_model(model)):
         raise ValueError("Feedback probing requires a paired relative SE3 checkpoint via --checkpoint")
-    if getattr(model, "tactile_input_kind", "") == "paired_force":
+    if is_pairwise_model(model):
         if args.mode != "contact-line-probe":
             raise ValueError("Paired SE3 checkpoint currently supports --mode contact-line-probe")
         if args.contact_line_auto_prepare and args.preparation_checkpoint is None:
@@ -3116,8 +3171,11 @@ def main() -> None:
         peaks = tactile_peaks(left, right)
         check_safety(args, force_reader, left, right)
         print("Current TCP [m,rotvec]:", np.round(current, 6))
-        if getattr(model, "tactile_input_kind", "") == "paired_force":
-            print("Paired model: reference tactile will be latched at probe start; peaks=", peaks)
+        if is_pairwise_model(model):
+            print(
+                f"Paired {model.tactile_input_kind} model: reference tactile will be "
+                f"latched at probe start; peaks={peaks}"
+            )
         elif args.mode == "fixed-cycle":
             # 只预热、检查传感器；即使启动时已有双侧接触，也推迟至拧转再预测。
             print("Fixed-cycle: pose inference deferred until screwing; peaks=", peaks)

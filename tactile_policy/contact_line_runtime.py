@@ -43,6 +43,8 @@ def add_probe_arguments(parser):
         'contact-change-n': .5, 'contact-loss-s': .3,
         'ramp-s': 3., 'rock-period-s': 20., 'deformation-roll-deg': .3,
         'deformation-pitch-deg': .2, 'normal-deformation-mm': 0.,
+        'back-forth-period-s': 8., 'back-forth-cycles': 2,
+        'back-forth-x-mm': .3, 'back-forth-y-mm': .3,
         'follow-s': 20., 'release-s': 3., 'release-timeout-s': 8.,
         'translation-gain': 1., 'rotation-gain': 1.,
         'max-speed-mm-s': 1., 'max-speed-deg-s': .5,
@@ -108,6 +110,10 @@ def make_controller_config(a):
     return ProbeConfig(
         settle_s=a.contact_line_reference_stable_s, ramp_s=a.contact_line_ramp_s,
         rock_period_s=a.contact_line_rock_period_s, rock_cycles=a.contact_line_probe_cycles,
+        back_forth_period_s=a.contact_line_back_forth_period_s,
+        back_forth_cycles=a.contact_line_back_forth_cycles,
+        back_forth_x_m=a.contact_line_back_forth_x_mm / 1000,
+        back_forth_y_m=a.contact_line_back_forth_y_mm / 1000,
         follow_s=a.contact_line_follow_s, release_s=a.contact_line_release_s,
         release_timeout_s=a.contact_line_release_timeout_s,
         angle_x_rad=np.deg2rad(a.contact_line_deformation_roll_deg),
@@ -238,7 +244,7 @@ def _json_value(value):
 
 def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, api):
     """Execute only through the entry point's existing --execute gate."""
-    if getattr(model, 'tactile_input_kind', '') != 'paired_force':
+    if getattr(model, 'tactile_input_kind', '') not in ('paired_force', 'paired_depth'):
         raise ValueError('feedback probing requires a paired relative SE3 checkpoint')
     baseline = args.contact_line_free_grasp_forces_n
     preparation = {}
@@ -246,7 +252,7 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
         if args.preparation_checkpoint is None:
             raise ValueError('automatic preparation requires --preparation-checkpoint')
         prep_model, prep_norm = api.load_model(args.preparation_checkpoint, device)
-        if getattr(prep_model, 'tactile_input_kind', '') == 'paired_force':
+        if getattr(prep_model, 'tactile_input_kind', '') in ('paired_force', 'paired_depth'):
             raise ValueError('preparation checkpoint must predict absolute offset')
         preparation = api.prepare_contact_line_probe(args, robot, tactile, force_reader, prep_model, prep_norm, device)
         baseline = preparation['free_grasp_forces_n']
@@ -336,7 +342,7 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                 if controller is None:
                     if not stable.update(sample['timestamp'], tcp, forces):
                         continue
-                    reference = api.paired_force_input(left, right)
+                    reference = api.paired_tactile_input(model, left, right)
                     reference_self = api.predict_pair_motion(model, norm, reference, reference, device)
                     if not np.isfinite(reference_self).all() or np.any(np.abs(reference_self) >= .25*target_limit):
                         raise api.SafetyStop('reference self-prediction too large; check model/preprocessing')
@@ -347,7 +353,10 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
                 if last_valid-last_step < 1/args.control_hz:
                     time.sleep(max(0., 1/args.contact_line_poll_hz-(time.monotonic()-tick)))
                     continue
-                raw_prediction = api.predict_pair_motion(model, norm, reference, api.paired_force_input(left, right), device)
+                raw_prediction = api.predict_pair_motion(
+                    model, norm, reference,
+                    api.paired_tactile_input(model, left, right), device,
+                )
                 now, wall = time.monotonic(), time.time()
                 if wall-min(sample['left_stamp'], sample['right_stamp']) > args.contact_line_max_age_ms/1000:
                     controller.pause(now)

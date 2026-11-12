@@ -10,8 +10,10 @@ MODEL_TYPES = (
     "fcn", "simple_cnn", "posenet_cnn", "nature_cnn", "resnet", "vit",
     "tactile_tokenizer",
 )
-PAIRWISE_BACKBONES = ("spatial",) + MODEL_TYPES
-PAIRWISE_MODEL_TYPES = ("pairwise_tactile_se3", "pairwise_backbone_se3")
+PAIRWISE_BACKBONES = ("spatial",) + MODEL_TYPES + ("native_depth_cnn",)
+PAIRWISE_MODEL_TYPES = (
+    "pairwise_tactile_se3", "pairwise_backbone_se3", "pairwise_native_depth_se3",
+)
 
 
 def reference_weight_init(module: nn.Module) -> None:
@@ -455,8 +457,38 @@ class PairwiseBackboneSE3Regressor(nn.Module):
         return self.head(features.reshape(batch, -1))
 
 
+class PairwiseNativeDepthSE3Regressor(nn.Module):
+    """Native-resolution depth model for reference/current bilateral images.
+
+    Input is [B, time=2, finger=2, H, W]. The four images are concatenated in
+    [reference-left, reference-right, current-left, current-right] order and
+    processed by the same NativeDepthCNN used by train_pose_real_image.py.
+    """
+
+    def __init__(self, input_hw: tuple[int, int] = (35, 20)) -> None:
+        super().__init__()
+        self.input_hw = tuple(int(value) for value in input_hw)
+        self.model_type = "pairwise_native_depth_se3"
+        self.model_config = {"input_hw": list(self.input_hw)}
+        self.tactile_input_kind = "paired_depth"
+        self.encoder = NativeDepthCNN(
+            in_channels=4, out_dim=6, input_hw=self.input_hw
+        )
+
+    def forward(self, tactile_pair: torch.Tensor) -> torch.Tensor:
+        expected = (2, 2, *self.input_hw)
+        if tactile_pair.ndim != 5 or tuple(tactile_pair.shape[1:]) != expected:
+            raise ValueError(
+                f"Expected [B,{','.join(map(str, expected))}], "
+                f"got {tuple(tactile_pair.shape)}"
+            )
+        batch = tactile_pair.shape[0]
+        return self.encoder(tactile_pair.reshape(batch, 4, *self.input_hw))
+
+
 def create_pairwise_model(backbone: str = "spatial", feature_dim: int = 128,
-                          grid_size: int = 20, image_size: int = 128) -> nn.Module:
+                          grid_size: int = 20, image_size: int = 128,
+                          input_hw: tuple[int, int] = (35, 20)) -> nn.Module:
     """Keep the original four-hand encoder as the default paired model."""
     if backbone == "spatial":
         model = PairwiseTactileSE3Regressor()
@@ -464,6 +496,8 @@ def create_pairwise_model(backbone: str = "spatial", feature_dim: int = 128,
         model.model_config = {}
         model.tactile_input_kind = "paired_force"
         return model
+    if backbone == "native_depth_cnn":
+        return PairwiseNativeDepthSE3Regressor(input_hw=input_hw)
     return PairwiseBackboneSE3Regressor(backbone, feature_dim, grid_size, image_size)
 
 
@@ -479,6 +513,17 @@ def load_pairwise_model(checkpoint: dict, device="cpu") -> nn.Module:
                 or config["backbone"] not in MODEL_TYPES):
             raise ValueError("Backbone checkpoint requires a complete, valid model_config")
         model = create_pairwise_model(**config)
+    elif model_type == "pairwise_native_depth_se3":
+        config = checkpoint.get("model_config")
+        if not isinstance(config, dict) or set(config) != {"input_hw"}:
+            raise ValueError("Depth checkpoint requires model_config={'input_hw': [H, W]}")
+        input_hw = config["input_hw"]
+        if (not isinstance(input_hw, (list, tuple)) or len(input_hw) != 2
+                or any(not isinstance(value, int) or value < 4 for value in input_hw)):
+            raise ValueError("Depth checkpoint has invalid input_hw")
+        model = create_pairwise_model(
+            backbone="native_depth_cnn", input_hw=tuple(input_hw)
+        )
     else:
         raise ValueError(f"Unsupported paired model type: {model_type!r}")
     model = model.to(device)
@@ -498,7 +543,7 @@ class TactilePoseCNN(nn.Module):
 
 # 新增：原始尺寸深度 CNN，独立于原有模型工厂，不改变分布力模型的行为。
 class NativeDepthCNN(nn.Module):
-    """直接接收左右深度 [B,2,H,W]，不缩放、不补成正方形。"""
+    """直接接收原始深度 [B,C,H,W]，不缩放、不补成正方形。"""
 
     def __init__(self, in_channels: int = 2, out_dim: int = 6,
                  input_hw: tuple[int, int] = (35, 20)) -> None:

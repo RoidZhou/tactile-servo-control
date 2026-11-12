@@ -26,6 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-root", type=Path, default=Path("/media/zhou/Elements SE/YBZHOU/nut_relative_ou_217"))
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="Defaults to the original directory for spatial, or a backbone-specific directory.")
+    parser.add_argument(
+        "--input-modality", choices=("distributed_force", "depth"),
+        default="distributed_force",
+        help=("Tactile input. depth uses embedded left/right depth PNGs, the "
+              "training-set maximum divisor, and native image resolution."),
+    )
     parser.add_argument("--backbone", choices=PAIRWISE_BACKBONES, default="spatial",
                         help="spatial preserves the original four-hand model; others encode each bilateral frame.")
     parser.add_argument("--feature-dim", type=int, default=128,
@@ -38,7 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--pairs-per-episode", type=int, default=200)
+    parser.add_argument(
+        "--pairs-per-episode", type=int, default=10,
+        help=("Fresh training pairs sampled per episode at every epoch; the same "
+              "count of validation pairs is sampled once and then kept fixed. "
+              "Use 20-50 for denser coverage of roughly 200-frame episodes."),
+    )
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--patience", type=int, default=300)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -50,12 +61,21 @@ def parse_args() -> argparse.Namespace:
         help="Normalization limits dx,dy,dz(m), drx,dry,drz(rad), matching OU limits.",
     )
     args = parser.parse_args()
+    if args.input_modality == "depth":
+        if args.backbone not in ("spatial", "native_depth_cnn"):
+            parser.error(
+                "--input-modality depth uses the train_pose_real_image.py "
+                "NativeDepthCNN; omit --backbone or set --backbone native_depth_cnn"
+            )
+        args.backbone = "native_depth_cnn"
+    elif args.backbone == "native_depth_cnn":
+        parser.error("--backbone native_depth_cnn requires --input-modality depth")
     for name in ("feature_dim", "grid_size", "image_size"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.output_dir is None:
         suffix = "" if args.backbone == "spatial" else f"_{args.backbone}"
-        args.output_dir = Path(f"tactile_policy/outputs/relative_se3_200_217{suffix}")
+        args.output_dir = Path(f"tactile_policy/outputs/relative_se3_600_200{suffix}")
     try:
         args.target_limit = np.asarray(
             [float(value) for value in args.target_limit.split(",")], dtype=np.float32
@@ -66,6 +86,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--target-limit needs six positive numbers")
     if not 0 < args.val_ratio < 1:
         parser.error("--val-ratio must be in (0,1)")
+    if args.pairs_per_episode < 1:
+        parser.error("--pairs-per-episode must be positive")
     return args
 
 
@@ -94,13 +116,9 @@ def main() -> None:
         "cuda" if args.device == "auto" and torch.cuda.is_available()
         else "cpu" if args.device == "auto" else args.device
     )
-    # Validate the architecture before loading the full dataset.
-    model = create_pairwise_model(
-        args.backbone, args.feature_dim, args.grid_size, args.image_size,
-    )
     train_set, val_set, normalization, info = load_pair_datasets(
         args.dataset_root, args.val_ratio, args.pairs_per_episode,
-        args.target_limit, args.seed,
+        args.target_limit, args.seed, args.input_modality,
     )
     print(json.dumps({key: value for key, value in info.items()
                       if key not in ("train_episode_ids", "val_episode_ids")}, indent=2))
@@ -112,7 +130,12 @@ def main() -> None:
         val_set, args.batch_size, shuffle=False, num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    model = model.to(device)
+    input_shape = info["input_shape_per_frame"]
+    input_hw = tuple(input_shape[-2:])
+    model = create_pairwise_model(
+        args.backbone, args.feature_dim, args.grid_size, args.image_size,
+        input_hw=input_hw,
+    ).to(device)
     print(f"Model: {model.model_type} config={model.model_config}", flush=True)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -130,6 +153,9 @@ def main() -> None:
     history.write_text("", encoding="utf-8")
     best, stale = float("inf"), 0
     for epoch in range(1, args.epochs + 1):
+        # Deterministic across reruns, different across epochs. Validation set
+        # is a separate immutable Dataset and is deliberately not resampled.
+        train_set.resample_pairs((args.seed, epoch))
         model.train()
         loss_sum = count = 0
         for inputs, targets in train_loader:
@@ -143,7 +169,13 @@ def main() -> None:
         train_loss = loss_sum / count
         val_loss, mae = evaluate(model, val_loader, device, limit)
         scheduler.step(val_loss)
-        metrics = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}
+        metrics = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "train_pairs": len(train_set),
+            "val_pairs": len(val_set),
+        }
         metrics.update({f"mae_{name}": float(value) for name, value in zip(TARGET_NAMES, mae)})
         with history.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(metrics) + "\n")
@@ -162,6 +194,32 @@ def main() -> None:
                 "normalization": normalization.as_dict(),
                 "target_names": TARGET_NAMES,
                 "transform_convention": "inv(T_world_tcp_1) @ T_world_tcp_2; local xyz + rotvec",
+                "input_modality": args.input_modality,
+                "input_keys": (
+                    ["observation.tactile_left.depth", "observation.tactile_right.depth"]
+                    if args.input_modality == "depth"
+                    else ["observation.tactile_left.distributed_force",
+                          "observation.tactile_right.distributed_force"]
+                ),
+                "input_shape_per_frame": input_shape,
+                "input_preprocessing": (
+                    {
+                        "type": "depth_png_uint8_train_max",
+                        "channel_order_per_time": ["left", "right"],
+                        "time_order": ["reference", "current"],
+                        "png_channel": 0,
+                        "divisor": info["input_scale"],
+                        "signed_log1p": False,
+                        "per_image_normalization": False,
+                        "resize": None,
+                    }
+                    if args.input_modality == "depth"
+                    else {
+                        "type": "distributed_force_signed_log1p_standardized",
+                        "channel_order_per_time": ["left_xyz", "right_xyz"],
+                        "time_order": ["reference", "current"],
+                    }
+                ),
                 "dataset_info": info,
                 "args": {key: str(value) if isinstance(value, Path) else value
                          for key, value in vars(args).items() if key != "target_limit"},

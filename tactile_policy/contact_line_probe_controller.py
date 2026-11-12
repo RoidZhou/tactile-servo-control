@@ -70,6 +70,10 @@ class ProbeConfig:
     ramp_s: float = 3.
     rock_period_s: float = 20.
     rock_cycles: int = 2
+    back_forth_period_s: float = 8.
+    back_forth_cycles: int = 2
+    back_forth_x_m: float = .0003
+    back_forth_y_m: float = .0003
     follow_s: float = 20.
     release_s: float = 3.
     release_timeout_s: float = 8.
@@ -105,7 +109,10 @@ class ProbeConfig:
     follow_enabled: bool = True
 
     def __post_init__(self):
-        nonnegative = {'settle_s', 'angle_x_rad', 'angle_y_rad'}
+        nonnegative = {
+            'settle_s', 'angle_x_rad', 'angle_y_rad',
+            'back_forth_x_m', 'back_forth_y_m',
+        }
         for item in fields(self):
             value = getattr(self, item.name)
             if item.name == 'follow_enabled':
@@ -118,7 +125,7 @@ class ProbeConfig:
                 continue
             if value < 0 or (value == 0 and item.name not in nonnegative):
                 raise ValueError(item.name + ' must be positive')
-        for name in ('rock_cycles', 'min_line_samples'):
+        for name in ('rock_cycles', 'back_forth_cycles', 'min_line_samples'):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(name + ' must be an integer')
@@ -127,7 +134,7 @@ class ProbeConfig:
 
 
 class ProbeController:
-    """Feedback controller with settle/ramp/rock/follow/release/done states.
+    """Feedback controller with push-down/rock/back-forth probe states.
 
     ``prediction`` is D_t expressed at the original reference TCP. H is the
     fixed TCP->feedback-point transform. E=inv(D_s)D_t is conjugated by H,
@@ -143,7 +150,7 @@ class ProbeController:
         self.reference = _transform(np.zeros(6) if initial_reference_prediction is None
                                     else initial_reference_prediction)
         self.initial_feedback = self.initial @ self.H
-        self.stage = 'ramp' if reference_stable else 'settle'
+        self.stage = 'push_down' if reference_stable else 'settle'
         self.elapsed = 0.
         self.last_time = None
         self.velocity = np.zeros(6)
@@ -257,13 +264,20 @@ class ProbeController:
     def _target(self):
         c = self.config
         desired = np.zeros(6)
-        if self.stage == 'ramp':
+        if self.stage == 'push_down':
             desired[2] = c.normal_target_m * _smooth(self.elapsed / c.ramp_s)
-            desired[3] = c.angle_x_rad * _smooth(self.elapsed / c.ramp_s)
         elif self.stage == 'rock':
             phase = 2 * np.pi * self.elapsed / c.rock_period_s
             desired[2] = c.normal_target_m
             desired[3:5] = [c.angle_x_rad * np.cos(phase), c.angle_y_rad * np.sin(phase)]
+        elif self.stage == 'back_forth_x':
+            phase = 2 * np.pi * self.elapsed / c.back_forth_period_s
+            desired[0] = c.back_forth_x_m * np.sin(phase)
+            desired[2] = c.normal_target_m
+        elif self.stage == 'back_forth_y':
+            phase = 2 * np.pi * self.elapsed / c.back_forth_period_s
+            desired[1] = c.back_forth_y_m * np.sin(phase)
+            desired[2] = c.normal_target_m
         elif self.stage == 'follow':
             desired = self.follow_target.copy()
         elif self.stage == 'release':
@@ -339,15 +353,22 @@ class ProbeController:
         self.reason = ''
         self.elapsed += dt
         if self.stage == 'settle' and self.elapsed >= c.settle_s:
-            self._transition('ramp')
-        elif self.stage == 'ramp' and self.elapsed >= c.ramp_s:
+            self._transition('push_down')
+        elif self.stage == 'push_down' and self.elapsed >= c.ramp_s:
             self._transition('rock')
         elif self.stage == 'rock':
-            if c.follow_enabled and self.elapsed >= c.rock_period_s and self.line_qualified:
-                self.follow_target = self._target().copy()
-                self._transition('follow')
-            elif self.elapsed >= c.rock_period_s * c.rock_cycles:
-                self._release('no_valid_line' if c.follow_enabled else 'follow_disabled')
+            if self.elapsed >= c.rock_period_s * c.rock_cycles:
+                self._transition('back_forth_x')
+        elif self.stage == 'back_forth_x':
+            if self.elapsed >= c.back_forth_period_s * c.back_forth_cycles:
+                self._transition('back_forth_y')
+        elif self.stage == 'back_forth_y':
+            if self.elapsed >= c.back_forth_period_s * c.back_forth_cycles:
+                if c.follow_enabled and self.line_qualified:
+                    self.follow_target = self._target().copy()
+                    self._transition('follow')
+                else:
+                    self._release('no_valid_line' if c.follow_enabled else 'follow_disabled')
         elif self.stage == 'follow' and self.elapsed >= c.follow_s:
             self._release('completed')
         desired = self._target()

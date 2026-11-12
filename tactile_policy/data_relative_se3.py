@@ -12,6 +12,11 @@ import torch
 from scipy.spatial.transform import Rotation
 from torch.utils.data import Dataset
 
+try:
+    from .data import DEPTH_KEYS, decode_depth_png
+except ImportError:
+    from data import DEPTH_KEYS, decode_depth_png
+
 LEFT_KEY = "observation.tactile_left.distributed_force"
 RIGHT_KEY = "observation.tactile_right.distributed_force"
 TCP_KEY = "observation.tcp_pose"
@@ -88,19 +93,92 @@ class PairedTactileSE3Dataset(Dataset):
         return torch.from_numpy(tactile.astype(np.float32)), torch.from_numpy(target)
 
 
+def sample_episode_pairs(
+    episode_rows: list[np.ndarray],
+    pairs_per_episode: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample unique, temporally ordered pairs independently inside each episode."""
+    if pairs_per_episode < 1:
+        raise ValueError("pairs_per_episode must be positive")
+    sampled: list[tuple[int, int]] = []
+    for rows in episode_rows:
+        rows = np.asarray(rows, dtype=np.int64)
+        possible = len(rows) * (len(rows) - 1) // 2
+        if pairs_per_episode > possible:
+            raise ValueError(
+                f"Requested {pairs_per_episode} pairs from an episode with only "
+                f"{len(rows)} frames ({possible} unique ordered pairs)"
+            )
+        chosen: set[tuple[int, int]] = set()
+        while len(chosen) < pairs_per_episode:
+            first_index, second_index = rng.choice(
+                len(rows), size=2, replace=False
+            ).tolist()
+            # ``rows`` is already sorted by frame_index. Compare positions,
+            # not global/local row IDs, so temporal direction remains correct
+            # even if Parquet row order is unusual.
+            if first_index > second_index:
+                first_index, second_index = second_index, first_index
+            chosen.add((int(rows[first_index]), int(rows[second_index])))
+        sampled.extend(sorted(chosen))
+    if not sampled:
+        raise ValueError("No episode pairs could be sampled")
+    return np.asarray(sampled, dtype=np.int64)
+
+
+class ResampledPairedTactileSE3Dataset(PairedTactileSE3Dataset):
+    """Training split whose within-episode frame pairs can change each epoch."""
+
+    def __init__(
+        self,
+        frames: np.ndarray,
+        poses: np.ndarray,
+        episode_rows: list[np.ndarray],
+        pairs_per_episode: int,
+        normalization: PairNormalization,
+        seed: int,
+    ) -> None:
+        self.episode_rows = [np.asarray(rows, dtype=np.int64) for rows in episode_rows]
+        self.pairs_per_episode = int(pairs_per_episode)
+        initial_pairs = sample_episode_pairs(
+            self.episode_rows, self.pairs_per_episode, np.random.default_rng(seed)
+        )
+        super().__init__(frames, poses, initial_pairs, normalization)
+
+    def resample_pairs(self, seed: int | tuple[int, ...]) -> None:
+        """Replace this epoch's pairs reproducibly without changing validation."""
+        self.pairs = sample_episode_pairs(
+            self.episode_rows,
+            self.pairs_per_episode,
+            np.random.default_rng(seed),
+        )
+
+
 def load_pair_datasets(
     root: str | Path,
     val_ratio: float,
     pairs_per_episode: int,
     target_limit: np.ndarray,
     seed: int,
+    input_modality: str = "distributed_force",
 ) -> tuple[PairedTactileSE3Dataset, PairedTactileSE3Dataset, PairNormalization, dict]:
+    if input_modality not in ("distributed_force", "depth"):
+        raise ValueError(
+            "input_modality must be 'distributed_force' or 'depth', got "
+            f"{input_modality!r}"
+        )
     root = Path(root).expanduser().resolve()
     files = sorted((root / "data").rglob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"No parquet files below {root / 'data'}")
     source = pads.dataset([str(path) for path in files], format="parquet")
-    required = {LEFT_KEY, RIGHT_KEY, TCP_KEY, "episode_index", "frame_index"}
+    tactile_keys = (
+        (LEFT_KEY, RIGHT_KEY)
+        if input_modality == "distributed_force"
+        else DEPTH_KEYS
+    )
+    required = {*tactile_keys, TCP_KEY, "episode_index", "frame_index"}
     missing = required - set(source.schema.names)
     if missing:
         raise ValueError(
@@ -111,63 +189,109 @@ def load_pair_datasets(
     meta = source.to_table(columns=["episode_index", "frame_index"])
     episodes = np.asarray(meta["episode_index"].to_pylist(), dtype=np.int64)
     frame_indices = np.asarray(meta["frame_index"].to_pylist(), dtype=np.int64)
-    unique_episodes = np.unique(episodes)
+    episode_rows_global = {
+        int(episode): rows[np.argsort(frame_indices[rows])]
+        for episode in np.unique(episodes)
+        if len(rows := np.flatnonzero(episodes == episode)) >= 2
+    }
+    unique_episodes = np.asarray(sorted(episode_rows_global), dtype=np.int64)
     if len(unique_episodes) < 2:
         raise ValueError("At least two complete episodes are required for train/validation")
-    rng = np.random.default_rng(seed)
-    shuffled = rng.permutation(unique_episodes)
+    split_rng = np.random.default_rng(seed)
+    shuffled = split_rng.permutation(unique_episodes)
     n_val = min(len(shuffled) - 1, max(1, round(len(shuffled) * val_ratio)))
     val_eps = set(shuffled[:n_val].tolist())
 
-    global_pairs: dict[str, list[tuple[int, int]]] = {"train": [], "val": []}
-    for episode in unique_episodes:
-        rows = np.flatnonzero(episodes == episode)
-        rows = rows[np.argsort(frame_indices[rows])]
-        if len(rows) < 2:
-            continue
-        split = "val" if int(episode) in val_eps else "train"
-        for _ in range(pairs_per_episode):
-            selected = rng.choice(rows, size=2, replace=False)
-            # Preserve temporal direction, as in a reference/current pair.
-            first, second = sorted(selected.tolist())
-            global_pairs[split].append((first, second))
-    if not global_pairs["train"] or not global_pairs["val"]:
-        raise ValueError("Could not create nonempty episode-wise train and validation pairs")
-
-    selected_rows = np.unique(np.asarray(
-        global_pairs["train"] + global_pairs["val"], dtype=np.int64
-    ).reshape(-1))
-    table = source.take(
-        pa.array(selected_rows), columns=[LEFT_KEY, RIGHT_KEY, TCP_KEY]
-    )
-    left = _force_to_chw(table[LEFT_KEY].to_pylist())
-    right = _force_to_chw(table[RIGHT_KEY].to_pylist())
-    frames = signed_log1p(np.concatenate((left, right), axis=1)).astype(np.float32)
+    # Dynamic training pairs need every frame from every eligible episode, not
+    # merely the frames touched by one startup-time random draw.
+    selected_rows = np.unique(np.concatenate(list(episode_rows_global.values())))
+    table = source.take(pa.array(selected_rows), columns=[*tactile_keys, TCP_KEY])
+    if input_modality == "distributed_force":
+        left = _force_to_chw(table[LEFT_KEY].to_pylist())
+        right = _force_to_chw(table[RIGHT_KEY].to_pylist())
+        frames = signed_log1p(np.concatenate((left, right), axis=1)).astype(np.float32)
+    else:
+        sides = []
+        expected_hw = None
+        for key in DEPTH_KEYS:
+            decoded = []
+            for local_index, value in enumerate(table[key].to_pylist()):
+                try:
+                    depth = decode_depth_png(value)
+                except (ValueError, OSError, TypeError) as exc:
+                    global_row = int(selected_rows[local_index])
+                    raise ValueError(
+                        f"Invalid {key} at dataset row {global_row}: {exc}"
+                    ) from exc
+                if expected_hw is None:
+                    expected_hw = depth.shape
+                elif depth.shape != expected_hw:
+                    raise ValueError(
+                        f"Depth image shape changed from {expected_hw} to {depth.shape} "
+                        f"at dataset row {int(selected_rows[local_index])}"
+                    )
+                decoded.append(depth)
+            sides.append(np.stack(decoded))
+        # Each frame is [left, right, H, W]. Dataset pairing adds the
+        # reference/current dimension, yielding [2, 2, H, W].
+        # Keep decoded depth compact in memory. Dataset normalization converts
+        # a selected pair to float32 only when __getitem__ is called.
+        frames = np.stack(sides, axis=1)
     poses = np.asarray(table[TCP_KEY].to_pylist(), dtype=np.float32)
     row_to_local = {int(row): index for index, row in enumerate(selected_rows)}
-
-    def remap(pairs: list[tuple[int, int]]) -> np.ndarray:
-        return np.asarray(
-            [(row_to_local[a], row_to_local[b]) for a, b in pairs], dtype=np.int64
-        )
-
-    train_pairs, val_pairs = remap(global_pairs["train"]), remap(global_pairs["val"])
-    train_rows = np.unique(train_pairs.reshape(-1))
-    input_mean = frames[train_rows].mean(axis=(0, 2, 3), dtype=np.float64).astype(np.float32)
-    input_std = frames[train_rows].std(axis=(0, 2, 3), dtype=np.float64).astype(np.float32)
+    train_episode_rows = [
+        np.asarray([row_to_local[int(row)] for row in episode_rows_global[int(episode)]])
+        for episode in unique_episodes if int(episode) not in val_eps
+    ]
+    val_episode_rows = [
+        np.asarray([row_to_local[int(row)] for row in episode_rows_global[int(episode)]])
+        for episode in unique_episodes if int(episode) in val_eps
+    ]
+    # Validation pairs are drawn exactly once and never mutated by the
+    # training loop, so validation loss remains comparable across epochs.
+    val_pairs = sample_episode_pairs(
+        val_episode_rows, pairs_per_episode, np.random.default_rng((seed, 0x56414C))
+    )
+    train_rows = np.unique(np.concatenate(train_episode_rows))
+    if input_modality == "distributed_force":
+        input_mean = frames[train_rows].mean(
+            axis=(0, 2, 3), dtype=np.float64
+        ).astype(np.float32)
+        input_std = frames[train_rows].std(
+            axis=(0, 2, 3), dtype=np.float64
+        ).astype(np.float32)
+        input_scale = None
+    else:
+        # Same preprocessing as train_pose_real_image.py: use one training-set
+        # maximum for both fingers, without per-image normalization or resize.
+        input_scale = max(float(frames[train_rows].max()), 1.0)
+        input_mean = np.zeros(frames.shape[1], dtype=np.float32)
+        input_std = np.full(frames.shape[1], input_scale, dtype=np.float32)
     normalization = PairNormalization(
         input_mean, np.maximum(input_std, 1e-6), np.asarray(target_limit, dtype=np.float32)
     )
     info = {
         "episodes": len(unique_episodes), "train_episodes": len(unique_episodes) - n_val,
         "val_episodes": n_val, "loaded_unique_frames": len(selected_rows),
-        "train_pairs": len(train_pairs), "val_pairs": len(val_pairs),
+        "train_frames": int(sum(map(len, train_episode_rows))),
+        "val_frames": int(sum(map(len, val_episode_rows))),
+        "pairs_per_episode": int(pairs_per_episode),
+        "train_pairs_per_epoch": len(train_episode_rows) * pairs_per_episode,
+        "val_pairs": len(val_pairs),
+        "train_pair_sampling": "resampled_each_epoch_without_replacement",
+        "val_pair_sampling": "fixed_at_startup",
         "train_episode_ids": sorted(int(value) for value in unique_episodes
                                      if int(value) not in val_eps),
         "val_episode_ids": sorted(int(value) for value in val_eps),
+        "input_modality": input_modality,
+        "input_shape_per_frame": list(frames.shape[1:]),
+        "input_scale": input_scale,
     }
     return (
-        PairedTactileSE3Dataset(frames, poses, train_pairs, normalization),
+        ResampledPairedTactileSE3Dataset(
+            frames, poses, train_episode_rows, pairs_per_episode,
+            normalization, seed,
+        ),
         PairedTactileSE3Dataset(frames, poses, val_pairs, normalization),
         normalization, info,
     )
