@@ -67,19 +67,20 @@ def _smooth(value):
 @dataclass
 class ProbeConfig:
     settle_s: float = 1.
-    ramp_s: float = 3.
+    # Original-project timing at 100 Hz: pushdown <=1200 frames,
+    # pre-rock tilt 500 frames, rocking 1.25*2000 frames, release 500 frames.
+    # Durations, rather than frame counts, keep the profile meaningful with a
+    # slower XENSE inference loop.
+    ramp_s: float = 12.
+    rock_tilt_s: float = 5.
     rock_period_s: float = 20.
     rock_cycles: float = 1.25
-    back_forth_period_s: float = 8.
-    back_forth_cycles: int = 2
-    back_forth_x_m: float = .0003
-    back_forth_y_m: float = .0003
     follow_s: float = 20.
-    release_s: float = 3.
+    release_s: float = 5.
     release_timeout_s: float = 8.
-    angle_x_rad: float = np.deg2rad(.3)
-    angle_y_rad: float = np.deg2rad(.2)
-    normal_target_m: float = 0.
+    angle_x_rad: float = np.deg2rad(1.)
+    angle_y_rad: float = np.deg2rad(.6)
+    normal_target_m: float = .0003
     translation_gain_s: float = 1.
     rotation_gain_s: float = 1.
     max_linear_speed_m_s: float = .001
@@ -111,7 +112,6 @@ class ProbeConfig:
     def __post_init__(self):
         nonnegative = {
             'settle_s', 'angle_x_rad', 'angle_y_rad',
-            'back_forth_x_m', 'back_forth_y_m',
         }
         for item in fields(self):
             value = getattr(self, item.name)
@@ -127,7 +127,7 @@ class ProbeConfig:
                 raise ValueError(item.name + ' must be positive')
         if self.rock_cycles <= 0:
             raise ValueError('rock_cycles must be positive')
-        for name in ('back_forth_cycles', 'min_line_samples'):
+        for name in ('min_line_samples',):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError(name + ' must be an integer')
@@ -136,7 +136,12 @@ class ProbeConfig:
 
 
 class ProbeController:
-    """Feedback controller with push-down/rock/back-forth probe states.
+    """Feedback controller with the original-project rocking profile.
+
+    The active sequence is push_down -> rock_tilt -> rock -> rock_release.
+    All rotations are applied about ``H``: the calibrated nut centre in the
+    stable reference TCP frame.  Optional estimated-line following starts
+    only after that four-stage measurement sequence is complete.
 
     ``prediction`` is D_t expressed at the original reference TCP. H is the
     fixed TCP->feedback-point transform. E=inv(D_s)D_t is conjugated by H,
@@ -268,18 +273,20 @@ class ProbeController:
         desired = np.zeros(6)
         if self.stage == 'push_down':
             desired[2] = c.normal_target_m * _smooth(self.elapsed / c.ramp_s)
+        elif self.stage == 'rock_tilt':
+            # Original rocking() first ramps desired roll from zero to one
+            # degree while desired pitch remains zero (500 frames at 100 Hz).
+            desired[2] = c.normal_target_m
+            desired[3] = c.angle_x_rad * _smooth(self.elapsed / c.rock_tilt_s)
         elif self.stage == 'rock':
             phase = 2 * np.pi * self.elapsed / c.rock_period_s
             desired[2] = c.normal_target_m
             desired[3:5] = [c.angle_x_rad * np.cos(phase), c.angle_y_rad * np.sin(phase)]
-        elif self.stage == 'back_forth_x':
-            phase = 2 * np.pi * self.elapsed / c.back_forth_period_s
-            desired[0] = c.back_forth_x_m * np.sin(phase)
+        elif self.stage == 'rock_release':
+            # At 1.25 cycles the ellipse ends at (roll, pitch)=(0,+Ay).
+            # Match the original 500-frame release by reducing pitch to zero.
             desired[2] = c.normal_target_m
-        elif self.stage == 'back_forth_y':
-            phase = 2 * np.pi * self.elapsed / c.back_forth_period_s
-            desired[1] = c.back_forth_y_m * np.sin(phase)
-            desired[2] = c.normal_target_m
+            desired[4] = c.angle_y_rad * (1 - _smooth(self.elapsed / c.release_s))
         elif self.stage == 'follow':
             desired = self.follow_target.copy()
         elif self.stage == 'release':
@@ -363,20 +370,16 @@ class ProbeController:
         if self.stage == 'settle' and self.elapsed >= c.settle_s:
             self._transition('push_down')
         elif self.stage == 'push_down' and self.elapsed >= c.ramp_s:
+            self._transition('rock_tilt')
+        elif self.stage == 'rock_tilt' and self.elapsed >= c.rock_tilt_s:
             self._transition('rock')
         elif self.stage == 'rock':
             if self.elapsed >= c.rock_period_s * c.rock_cycles:
-                self._transition('back_forth_x')
-        elif self.stage == 'back_forth_x':
-            if self.elapsed >= c.back_forth_period_s * c.back_forth_cycles:
-                self._transition('back_forth_y')
-        elif self.stage == 'back_forth_y':
-            if self.elapsed >= c.back_forth_period_s * c.back_forth_cycles:
-                if c.follow_enabled and self.line_qualified:
-                    self.follow_target = self._target().copy()
-                    self._transition('follow')
-                else:
-                    self._release('no_valid_line' if c.follow_enabled else 'follow_disabled')
+                self._transition('rock_release')
+        elif self.stage == 'rock_release' and self.elapsed >= c.release_s:
+            # Completion is handled after recomputing the final release target
+            # and its feedback error below.
+            pass
         elif self.stage == 'follow' and self.elapsed >= c.follow_s:
             self._release('completed')
         desired = self._target()
@@ -384,6 +387,20 @@ class ProbeController:
         E = self.H_inv @ _inverse(Ds) @ D @ self.H
         desired_R = _transform(desired)[:3, :3]
         error = np.r_[desired_R @ E[:3, 3], desired_R @ _rotation(E[:3, :3]).as_rotvec()]
+        if self.stage == 'rock_release' and self.elapsed >= c.release_s:
+            # The original implementation advances by a fixed 500 frames and
+            # stops; it does not gate phase completion on tactile convergence.
+            if c.follow_enabled and self.line_qualified:
+                self.follow_target = desired.copy()
+                self._transition('follow')
+                desired = self._target()
+            else:
+                self.stage, self.finished = 'done', True
+                self.status = 'no_valid_line' if c.follow_enabled else 'completed'
+                self.reason = 'no_valid_line' if c.follow_enabled else 'profile_completed'
+                self.velocity[:] = 0
+                self.tcp_velocity[:] = 0
+                return self._result(actual, desired, measured, error, dt)
         if self.stage == 'release' and self.elapsed >= c.release_s:
             if (np.linalg.norm(error[:3]) <= c.release_position_tolerance_m
                     and np.linalg.norm(error[3:]) <= c.release_angle_tolerance_rad):

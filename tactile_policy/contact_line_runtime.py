@@ -41,12 +41,10 @@ def add_probe_arguments(parser):
         'reference-stable-s': 1., 'reference-timeout-s': 15.,
         'reference-position-mm': .1, 'reference-angle-deg': .1, 'reference-force-n': .2,
         'contact-change-n': .5, 'contact-release-n': .25, 'contact-loss-s': .3,
-        'ramp-s': 5., 'rock-period-s': 20., 'rock-cycles': 1.25,
+        'ramp-s': 12., 'rock-tilt-s': 5., 'rock-period-s': 20., 'rock-cycles': 1.25,
         'deformation-roll-deg': 1., 'deformation-pitch-deg': .6,
-        'normal-deformation-mm': 0.,
-        'back-forth-period-s': 8., 'back-forth-cycles': 2,
-        'back-forth-x-mm': .3, 'back-forth-y-mm': .3,
-        'follow-s': 20., 'release-s': 3., 'release-timeout-s': 8.,
+        'normal-deformation-mm': .3,
+        'follow-s': 20., 'release-s': 5., 'release-timeout-s': 8.,
         'translation-gain': 1., 'rotation-gain': 1.,
         'max-speed-mm-s': 1., 'max-speed-deg-s': .5,
         'max-accel-mm-s2': 2., 'max-accel-deg-s2': 1.,
@@ -134,16 +132,10 @@ def make_controller_config(a):
                           getattr(a, 'contact_line_probe_cycles', None))
     if rock_cycles is None:
         raise ValueError('missing rocking cycle count')
-    back_forth_cycles = float(a.contact_line_back_forth_cycles)
-    if not back_forth_cycles.is_integer():
-        raise ValueError('back_forth_cycles must be an integer')
     return ProbeConfig(
         settle_s=a.contact_line_reference_stable_s, ramp_s=a.contact_line_ramp_s,
+        rock_tilt_s=a.contact_line_rock_tilt_s,
         rock_period_s=a.contact_line_rock_period_s, rock_cycles=float(rock_cycles),
-        back_forth_period_s=a.contact_line_back_forth_period_s,
-        back_forth_cycles=int(back_forth_cycles),
-        back_forth_x_m=a.contact_line_back_forth_x_mm / 1000,
-        back_forth_y_m=a.contact_line_back_forth_y_mm / 1000,
         follow_s=a.contact_line_follow_s, release_s=a.contact_line_release_s,
         release_timeout_s=a.contact_line_release_timeout_s,
         angle_x_rad=np.deg2rad(a.contact_line_deformation_roll_deg),
@@ -403,8 +395,10 @@ def run_feedback_probe(args, robot, tactile, force_reader, model, norm, device, 
     sample = contact = forces = None
     count = 0
     worker = LatestEstimateWorker(estimator)
-    print('[contact-line] feedback: stable reference -> push-down -> rocking -> '
-          'back-and-forth-x/y -> qualified line follow -> release', flush=True)
+    print('[contact-line] feedback: stable reference -> push-down -> rock-tilt -> '
+          '1.25-cycle rocking -> rock-release -> optional qualified-line follow', flush=True)
+    print('[contact-line] calibrated feedback point (mm):', np.round(point * 1000., 3),
+          '(all tilt commands pivot about this point)', flush=True)
     print('[contact-line] bottom plane (mm), normal:', args.contact_line_plane_point_mm, args.contact_line_plane_normal, flush=True)
     print('[contact-line] plane source:', args.contact_line_plane_point_source, flush=True)
     print('[contact-line] CSV:', output, '; metadata:', meta_path, flush=True)

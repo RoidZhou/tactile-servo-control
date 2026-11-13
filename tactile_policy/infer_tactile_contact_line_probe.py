@@ -553,16 +553,22 @@ def build_parser() -> argparse.ArgumentParser:
     reference.add_argument("--contact-line-reference-force-n", type=float, default=0.2)
 
     motion = parser.add_argument_group("Paper-style active probing")
-    motion.add_argument("--contact-line-probe-cycles", type=int, default=1.25)
-    motion.add_argument("--contact-line-ramp-s", type=float, default=3.0)
+    motion.add_argument("--contact-line-probe-cycles", type=float, default=1.25)
+    motion.add_argument(
+        "--contact-line-ramp-s", type=float, default=12.0,
+        help="Maximum-duration passive push-down ramp (1200 frames / 100 Hz in the original project).",
+    )
+    motion.add_argument(
+        "--contact-line-rock-tilt-s", type=float, default=5.0,
+        help="Pre-rock roll ramp (500 frames / 100 Hz in the original project).",
+    )
     motion.add_argument("--contact-line-rock-period-s", type=float, default=20.0)
     motion.add_argument("--contact-line-deformation-roll-deg", type=float, default=1.0)
     motion.add_argument("--contact-line-deformation-pitch-deg", type=float, default=0.6)
-    motion.add_argument("--contact-line-normal-deformation-mm", type=float, default=0.0)
-    motion.add_argument("--contact-line-back-forth-period-s", type=float, default=8.0)
-    motion.add_argument("--contact-line-back-forth-cycles", type=int, default=2)
-    motion.add_argument("--contact-line-back-forth-x-mm", type=float, default=0.3)
-    motion.add_argument("--contact-line-back-forth-y-mm", type=float, default=0.3)
+    motion.add_argument(
+        "--contact-line-normal-deformation-mm", type=float, default=0.3,
+        help="Positive deformation follows --contact-line-plane-normal (TCP local +z by default).",
+    )
     motion.add_argument("--contact-line-translation-gain", type=float, default=1.0)
     motion.add_argument("--contact-line-rotation-gain", type=float, default=1.0)
     motion.add_argument("--contact-line-max-speed-mm-s", type=float, default=1.0)
@@ -593,7 +599,10 @@ def build_parser() -> argparse.ArgumentParser:
     estimator.add_argument("--contact-line-line-stable-s", type=float, default=2.0)
     estimator.add_argument("--contact-line-line-max-age-s", type=float, default=0.5)
     estimator.add_argument("--contact-line-follow-s", type=float, default=20.0)
-    estimator.add_argument("--contact-line-release-s", type=float, default=3.0)
+    estimator.add_argument(
+        "--contact-line-release-s", type=float, default=5.0,
+        help="Rock-release duration (500 frames / 100 Hz in the original project).",
+    )
     estimator.add_argument("--contact-line-release-timeout-s", type=float, default=8.0)
     estimator.add_argument(
         "--follow-estimated-line", action=argparse.BooleanOptionalAction,
@@ -728,9 +737,15 @@ def main() -> None:
              "disabled; nut must already be grasped and lightly touching bolt"),
         )
         print(
-            "  sequence: stable reference -> push-down -> rocking -> "
-            "back-and-forth -> line optimization"
+            "  sequence: stable reference -> push-down -> rock-tilt -> "
+            "1.25-cycle rocking -> rock-release -> line optimization"
         )
+        feedback_point = (
+            np.asarray(args.standard_tcp_to_nut_center, dtype=np.float64) * 1000.0
+            if args.contact_line_feedback_point_mm is None
+            else np.asarray(args.contact_line_feedback_point_mm, dtype=np.float64)
+        )
+        print("  calibrated nut-centre pivot in reference TCP (mm):", np.round(feedback_point, 3))
         print(
             "  contact thresholds: descent={:.3f}N, acquire={:.3f}N, "
             "release={:.3f}N".format(
